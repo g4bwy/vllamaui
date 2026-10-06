@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "filesystem": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/home/you/projects"],
+      "timeout_ms": 30000
+    },
+    "own-fixture": {
+      "command": "./server-go/mcp-fixture",
+      "timeout_ms": 8000
+    }
+  }
+}

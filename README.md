@@ -36,11 +36,144 @@ The prebuilt UI ships in `dist/`. To rebuild it after you change the frontend
 source, run `./build.sh`. To refresh the source from a llama.cpp checkout, run
 `./build.sh --from /path/to/llama.cpp/tools/ui`.
 
+## Which server do I run
+
+There are two implementations of the same job, and they speak the same HTTP to
+both the browser and the backend:
+
+- `server-go/` is Go. It is the one to run, and it is the only one that does tool
+  calling and MCP. Build it once, then run a single static binary.
+- `server/adapter.mjs` is Node. It needs no build step and no toolchain, so it
+  stays as the quick path and as the reference the Go port was measured against. It
+  answers `GET /tools` with an empty list and 501s `/cors-proxy`, which is what
+  turns the webui's tool panel off.
+
+Both read the same `.env`, serve the same `dist/`, and answer the same routes. On
+one live vLLM server, `/props` and `/vllm/stats` came back identical apart from the
+sample time, the rates window, and `cors_proxy_enabled`, which differed because the
+Go instance had been started with `--ui-mcp-proxy`.
+
+### The Go server
+
+```sh
+cd server-go
+go build -o webui ./cmd/webui
+./webui --upstream http://127.0.0.1:8000 --tools=read_file,file_glob_search,grep_search,get_info
+```
+
+One dependency: `github.com/modelcontextprotocol/go-sdk`, the official MCP Go
+SDK, used only by `internal/mcpx`. Everything else is the standard library.
+
+| Flag | Environment | Meaning |
+| --- | --- | --- |
+| `-backend` | `BACKEND` | `auto`, `vllm` or `strata`. auto reads `/health` then `/version`. |
+| `-upstream` | `UPSTREAM_URL`, `VLLM_UPSTREAM` | Backend base URL. |
+| `-port`, `-host` | `PORT`, `HOST` | Listen address, 8080 on all interfaces by default. |
+| `-api-key` | `UPSTREAM_API_KEY`, `VLLM_API_KEY` | Bearer token sent to the backend. |
+| `-require-api-key` | `API_KEY` | Key callers must present for `/tools`. See below. |
+| `-tools` | `TOOLS` | Comma list of built-in tools, or `all`. Empty turns `/tools` off. |
+| `-mcp-servers-config`, `-mcp-servers-json` | `MCP_SERVERS_CONFIG`, `MCP_SERVERS_JSON` | The two MCP sources, usable together. |
+| `-ui-mcp-proxy` | `UI_MCP_PROXY` | Serve `/cors-proxy` for MCP servers reached from the browser. |
+| `-cors-origins` | `CORS_ORIGINS` | Origins allowed on the proxy. Defaults to the UI's own localhost origin. |
+| `-dist` | `UI_DIST` | Built UI to serve. |
+
+`-help` lists the rest, including the timing and probe switches the Node server
+has.
+
+### Tools, and the warning that goes with them
+
+`--tools` accepts the seven names llama-server has: `read_file`,
+`file_glob_search`, `grep_search`, `exec_shell_command`, `write_file`, `edit_file`
+and `get_info`, or `all`. Names, JSON schemas, descriptions, parameter defaults,
+the `16384` byte read cap, the `32 MiB` base64 cap, the `100` result limits, the
+`x-tool-cwd` and `x-resp-type` headers, the `[exit code: N]` tail, the flat error
+bodies and the `data: {"chunk":...}` streaming frames all follow llama-server, so
+the webui treats this server as if it were llama-server. `--tools-runtime` is
+accepted and refused rather than run on the host, because quietly ignoring a
+container or ssh target would execute commands somewhere the operator did not ask
+for.
+
+Read this before enabling the write tools. Like llama-server, this server does not
+confine anything: paths are cleaned but not jailed, `exec_shell_command` runs `sh
+-c` with the server's own environment and privileges, and `write_file` and
+`edit_file` can change any file that user can reach. The webui asks you to approve
+each call, which protects you from the model, not from a browser that can reach
+this port. So:
+
+- `read_file` on a machine with secrets on it discloses those secrets to whoever
+  can use the chat.
+- Bind to `--host 127.0.0.1`, or put it behind a proxy with access control.
+- Set `-require-api-key` when anything else may reach the port. The key guards
+  `/tools` and `/cors-proxy`, and the two accepted header forms match
+  llama-server: `Authorization: Bearer <key>` and `X-Api-Key: <key>`.
+- Prefer the read-only list above, and add `exec_shell_command` only when you need
+  it. `all` includes the write and shell tools.
+
+The browser has its own working directory per conversation, sent as `x-tool-cwd`.
+The picker only appears when at least one enabled tool declares `uses_cwd`.
+
+### MCP servers
+
+Configuration is the Cursor-shaped file llama-server reads, so an existing
+`mcpServers` block works unchanged. `examples/mcp-servers.json` shows two entries.
+
+```json
+{
+  "mcpServers": {
+    "files": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/home/you/projects"],
+      "timeout_ms": 30000
+    }
+  }
+}
+```
+
+Each server starts as a child process speaking NDJSON JSON-RPC over stdio, is
+listed once during a warmup capped at 10 seconds, and appears to the model as
+`<server>_<tool>`. A tool whose prefixed name collides with a built-in tool is
+skipped with a log line, so a built-in never gets shadowed. A call sends the bare
+name. Text parts are joined into `plain_text_response`; `isError` becomes
+`error`. Image, audio and resource parts are dropped the way llama-server drops
+them, with one log line counting what was discarded, because an empty tool result
+is otherwise impossible to debug. A dead child is respawned, and a server that
+fails to start rests for five seconds, during which calls answer `MCP server
+unavailable: <name>`.
+
+A server entry may instead carry `"url"` to speak streamable HTTP. That is an
+addition over llama-server, which is stdio only, and it shares the same lifecycle.
+
+The webui also connects to MCP servers from the browser itself, over HTTP, SSE or
+WebSocket. Those need no server configuration. When one is CORS-limited, the
+browser goes through `/cors-proxy`, which exists only with `--ui-mcp-proxy`. The
+proxy forwards only headers named `x-llama-server-proxy-header-<name>`, renamed,
+so cookies, this server's key and any `Authorization` cannot leak to a third-party
+host, and it drops URL credentials and bounds the exchange.
+
+### Tests
+
+The Go server carries the test suite the Node one never had.
+
+```sh
+cd server-go
+go test -race ./...              # about 200 tests across six packages
+go test -race ./internal/mcpx/...  # spawns the fixture MCP server as a child
+```
+
+`internal/toolsapi`, `internal/builtin` and `internal/mcpx` are unit and
+integration tested offline, including the SSE frame shapes, the timing attribution
+guards, path escape attempts against `dist`, header precedence on `/tools`, tool
+timeout and respawn, and that the proxy cannot leak a cookie. `tests/tools-e2e.mjs`
+drives the whole loop in a real browser: the model asks for `read_file`, the UI
+prompts for approval, the tool runs over `POST /tools`, and the answer must contain
+what the file said.
+
 ## Two backends, one webui
 
 `server/adapter.mjs` owns the HTTP server, the static files, the SSE framing, the
 cancellation and the caching. `server/backends.mjs` owns everything that differs
-between engines. Each backend answers the same seven questions:
+between engines. In Go the same split is `internal/core` plus `internal/chat`
+against `internal/backend`, and each backend answers the same seven questions:
 
 | Question | vLLM | Strata |
 | --- | --- | --- |
@@ -406,6 +539,9 @@ which reports those things itself.
 ## Layout
 
 ```
+server-go/            the Go server: cmd/webui plus internal/{appconf,backend,chat,
+                      core,builtin,mcpx,toolsapi,contracts}
+examples/             sample mcpServers configuration
 server/adapter.mjs    HTTP server, static files, SSE plumbing, backend-agnostic
 server/backends.mjs   what differs between vLLM and Strata
 frontend/             extracted llama.cpp webui source plus the vLLM additions
@@ -413,6 +549,7 @@ dist/                 built frontend, what the adapter serves
 build.sh              rebuild dist/ from frontend/, optionally re-extract first
 run.sh                start, stop, and status for the adapter
 e2e.mjs               headless browser test of the running UI
+tests/tools-e2e.mjs   browser test of a real tool round trip through the model
 tests/mock-vllm.mjs   fake vLLM server
 tests/mock-strata.mjs fake Strata server, including the parts its own mock omits
 tests/vision-e2e.mjs  browser test that an attached image reaches the model
@@ -427,7 +564,9 @@ shots/                screenshots written by the browser tests
 `frontend/` carries the upstream `README.md` and the CMake files from `tools/ui`.
 Ignore both: they describe the llama.cpp build, which this project does not use.
 
-Requirements: Node 18 or newer (tested on Node 24) and a reachable backend.
+Requirements: a reachable backend, plus Node 18 or newer for the Node server and
+its browser tests (tested on Node 24), or Go 1.25 or newer for the Go server
+(tested on 1.26).
 
 ## Provenance
 

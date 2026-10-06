@@ -19,3 +19,7 @@ frontend/test-results/
 
 # local machine configuration (backend host, api key): see .env.example
 .env
+
+# go build output
+server-go/webui
+server-go/mcp-fixture
