@@ -87,7 +87,7 @@ func TestNilChild(t *testing.T) {
 
 func TestChildEnvOverridesTheParent(t *testing.T) {
 	t.Setenv("MCPX_TEST_PARENT", "parent-value")
-	env := childEnv(map[string]string{"MCPX_TEST_PARENT": "child-value", "MCPX_TEST_ONLY": "x"})
+	env := childEnv(ServerConfig{Env: map[string]string{"MCPX_TEST_PARENT": "child-value", "MCPX_TEST_ONLY": "x"}})
 	var parent, only int
 	for _, kv := range env {
 		switch kv {
@@ -102,7 +102,15 @@ func TestChildEnvOverridesTheParent(t *testing.T) {
 	if parent != 1 || only != 1 {
 		t.Errorf("env = %v, want the override applied once", env)
 	}
-	if len(env) <= len(os.Environ()) {
-		t.Error("childEnv dropped keys it should keep")
+	// The base is the allowlist, so every allowlisted key the parent has is
+	// still there next to the config entries.
+	got := map[string]bool{}
+	for _, kv := range env {
+		got[kv] = true
+	}
+	for _, key := range childEnvKeys {
+		if v, ok := os.LookupEnv(key); ok && !got[key+"="+v] {
+			t.Errorf("env lost the allowlisted %s", key)
+		}
 	}
 }

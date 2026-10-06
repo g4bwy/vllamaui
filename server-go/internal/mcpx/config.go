@@ -28,6 +28,11 @@ type ServerConfig struct {
 	Cwd     string
 	// TimeoutMS bounds one tools/call, and the (re)spawn that a call needs.
 	TimeoutMS int
+	// InheritEnv is not part of the C++ client. A stdio child normally starts
+	// from an allowlist of the parent's variables, so a third-party package
+	// cannot read the secrets the web server runs with. Setting it to true asks
+	// for the whole parent environment instead.
+	InheritEnv bool
 	// URL is not part of the C++ client. When it is set the entry talks to a
 	// streamable HTTP endpoint and Command may stay empty.
 	URL string
@@ -109,6 +114,9 @@ type serverJSON struct {
 	Cwd       string          `json:"cwd"`
 	TimeoutMS *float64        `json:"timeout_ms"`
 	URL       string          `json:"url"`
+	// InheritEnv asks for the parent environment for a stdio child. Absent is
+	// false, which is the safe default.
+	InheritEnv bool `json:"inherit_env"`
 }
 
 func parseCursorJSON(data []byte, log *slog.Logger) ([]ServerConfig, error) {
@@ -142,11 +150,12 @@ func parseCursorJSON(data []byte, log *slog.Logger) ([]ServerConfig, error) {
 			return nil, fmt.Errorf("server %q: %w", name, err)
 		}
 		s := ServerConfig{
-			Name:      name,
-			Command:   e.Command,
-			Cwd:       e.Cwd,
-			TimeoutMS: DefaultTimeoutMS,
-			URL:       e.URL,
+			Name:       name,
+			Command:    e.Command,
+			Cwd:        e.Cwd,
+			TimeoutMS:  DefaultTimeoutMS,
+			URL:        e.URL,
+			InheritEnv: e.InheritEnv,
 		}
 		if e.TimeoutMS != nil {
 			s.TimeoutMS = int(*e.TimeoutMS)

@@ -61,17 +61,27 @@ func (c *Client) connect(ctx context.Context, sc ServerConfig) (*mcp.ClientSessi
 	return sess, ch, nil
 }
 
+// childEnvKeys are the parent variables a stdio child may start with. The child
+// environment begins with these and nothing else, so the web server's secrets
+// (UPSTREAM_API_KEY and friends) never reach a third-party package that the
+// config asks uvx or npx to download and run. A server that needs the whole
+// parent environment asks for it with "inherit_env": true.
+var childEnvKeys = []string{
+	"PATH", "HOME", "USER", "LOGNAME", "SHELL", "TERM",
+	"LANG", "LC_ALL", "TZ", "TMPDIR",
+}
+
 // command is the stdio transport of server_mcp_stdio::start: the program with
-// its args, the parent environment with the config overrides on top, and cwd.
+// its args, a minimal environment with the config overrides on top, and cwd.
 func (c *Client) command(sc ServerConfig) (*exec.Cmd, *tail, error) {
 	if sc.Command == "" {
 		return nil, nil, fmt.Errorf("server %q has no command", sc.Name)
 	}
 	cmd := exec.CommandContext(c.ctx, sc.Command, sc.Args...)
 	cmd.Dir = sc.Cwd
-	if len(sc.Env) > 0 {
-		cmd.Env = childEnv(sc.Env)
-	}
+	// Always an explicit environment: leaving cmd.Env nil would hand the child
+	// the whole parent environment.
+	cmd.Env = childEnv(sc)
 	t := &tail{max: stderrTailMax}
 	cmd.Stderr = t
 	// The lifetime context is the child's leash: Shutdown cancels it, so no
@@ -81,10 +91,30 @@ func (c *Client) command(sc ServerConfig) (*exec.Cmd, *tail, error) {
 	return cmd, t, nil
 }
 
-// childEnv is mcp_build_env: the parent environment minus the keys the config
-// overrides, plus those keys.
-func childEnv(overrides map[string]string) []string {
-	env := os.Environ()
+// childEnv is mcp_build_env: the environment a stdio child starts with. It is
+// the config's env entries on top of the parent's allowlisted variables, or on
+// top of the whole parent environment when the entry asks for inherit_env.
+func childEnv(sc ServerConfig) []string {
+	base := os.Environ()
+	if !sc.InheritEnv {
+		base = minimalParentEnv()
+	}
+	return overrideEnv(base, sc.Env)
+}
+
+// minimalParentEnv is the parent's childEnvKeys variables, as many as it has.
+func minimalParentEnv() []string {
+	var env []string
+	for _, key := range childEnvKeys {
+		if v, ok := os.LookupEnv(key); ok {
+			env = append(env, key+"="+v)
+		}
+	}
+	return env
+}
+
+// overrideEnv is base minus the keys overrides sets, plus those keys.
+func overrideEnv(env []string, overrides map[string]string) []string {
 	out := make([]string, 0, len(env)+len(overrides))
 	for _, kv := range env {
 		key, _, _ := strings.Cut(kv, "=")
