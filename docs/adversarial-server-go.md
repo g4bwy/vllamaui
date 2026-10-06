@@ -11,20 +11,21 @@ not modified during the review.
 
 ## Status
 
-As of `9f4ff7e`, re-verified against the current tree on 2026-10-06.
+As of `3ac16f8`, re-verified against the current tree on 2026-10-06.
 
 Fixed:
 
-- Findings 1, 2, 3 (all Critical), in commits `d433d7b` and `1cf2c83`. See
-  the remediation log at the end.
-- Two side effects: the `read_file` TOCTOU Low (fixed with finding 1) and the
-  `api-key` header mismatch Low (gone with the CORS change).
+- Findings 1, 2, 3 (all Critical), in commits `d433d7b` and `1cf2c83`.
+- Findings 4 to 9 (all High), in `5f7d71f`, `5da2b1b`, `8077806`, `2d1fd48`,
+  `a33b031`, and `3ac16f8`. Round two is detailed in the remediation log.
+- Three side effects: the `read_file` TOCTOU Low (fixed with finding 1), the
+  `api-key` header mismatch Low (gone with the CORS change), and the
+  `read_file` context case of the request-context Medium.
 
 Todo:
 
-- High findings 4 to 9.
-- All Medium items. One is now half-done: `read_file` honors its request
-  context, `edit_file` still discards it.
+- The Medium items, except the read_file context case noted above
+  (`edit_file` still discards its context).
 - The remaining Low items.
 
 Line numbers below are as of the review tree. The fixes and the concurrent
@@ -119,7 +120,8 @@ Return upstream redirects to the caller instead of following them.
 
 ### 4. Chunks carrying `usage` are withheld, so per-chunk usage stats silently truncate the answer
 
-Status: open. `chat.go:228-233` unchanged.
+Status: fixed in `5f7d71f`. A usage chunk is held only when it carries no
+content, reasoning, or tool-call delta.
 
 Location: `internal/chat/chat.go:228-233`
 
@@ -133,7 +135,8 @@ the chunk and attach timings to a synthetic final frame.
 
 ### 5. `exec_shell_command` timeout is bypassable
 
-Status: open. `drain` still has no post-cancel deadline and no `WaitDelay`.
+Status: fixed in `5da2b1b`. After a one-second kill grace the alarm path
+closes the read end, so drain cannot outlive the timeout.
 
 Location: `internal/builtin/exec.go:82-108`
 
@@ -148,8 +151,9 @@ end when the alarm fires.
 
 ### 6. Every child process inherits the server's secrets
 
-Status: open. `exec.go` still never sets `cmd.Env`; `transport.go:72-74` still
-starts from `os.Environ()`.
+Status: fixed in `5da2b1b` (exec) and `8077806` (MCP). Both spawn paths
+start from a ten-name environment allowlist; MCP configs can opt back in
+with `"inherit_env": true`.
 
 Location: `internal/builtin/exec.go:76-92` (never sets `cmd.Env`),
 `internal/mcpx/transport.go:73,86-104` (`childEnv` starts from `os.Environ()`)
@@ -165,7 +169,8 @@ Fix direction: default to a small environment allowlist (`PATH`, `HOME`,
 
 ### 7. Revoked MCP tools stay callable; the advertised list is frozen at boot
 
-Status: open. `Merge` is still called once at startup (`main.go:164`).
+Status: fixed in `a33b031`. merged now answers List/Get/SupportsStream from
+a first-wins pass over the live registries on each call.
 
 Location: `internal/toolsapi/merge.go:14-34`, `internal/mcpx/client.go:195-226`
 
@@ -181,8 +186,8 @@ live, with first-wins resolution per call.
 
 ### 8. Unbounded body reads and no server timeouts on unauthenticated routes
 
-Status: open. Still no timeouts on `http.Server` (`core.go:98`) and no
-`http.MaxBytesReader` anywhere; only the chat route caps its body.
+Status: fixed in `3ac16f8`. /tools bodies cap at 16 MiB, relay bodies at
+64 MiB, relays at 32 concurrent, and the server carries read/idle timeouts.
 
 Location: `internal/core/core.go:98` (no timeouts on `http.Server`),
 `internal/toolsapi/toolsapi.go:186` and `internal/toolsapi/proxy.go:91`
@@ -198,8 +203,8 @@ Fix direction: wrap bodies in `http.MaxBytesReader`, set
 
 ### 9. Uncancellable regex blowup in the glob matcher
 
-Status: open. Now at `paths.go:68-116` (references shifted by the readfile
-commit's neighborhood, the matcher itself is unchanged).
+Status: fixed in `2d1fd48`. The matcher memoizes failed (pattern, name)
+states, so worst case is now polynomial: the 16-pair bomb answers in 22 µs.
 
 Location: `internal/builtin/paths.go:68-116`, `internal/builtin/globsearch.go:55-63`
 
@@ -349,24 +354,32 @@ in flight. All shared state was `-race` clean under stress.
 
 ## Suggested remediation order (remaining work)
 
-1. The `chat.go` cluster: finding 4, the silent-stream Medium, the dropped
-   error frame, and the missing streaming deadline. One file, one pass.
-2. The exec cluster: findings 5 and 6, plus the `edit_file` context.
-3. Finding 7 with the MCP config Mediums: `disabled`, `headers`,
-   `timeout_ms`.
-4. Finding 8 with the remaining unbounded reads (grep, edit, relay bodies)
-   and the server timeouts, as one hardening pass.
-5. Finding 9 and the grep output Mediums.
+All nine numbered findings are fixed. For the Medium and Low backlog:
+
+1. The `chat.go` leftovers: the silent-stream and dropped-error-frame
+   Mediums, the missing streaming deadline, and the vision-flag text match
+   (which also lives in `backend/vllm.go`).
+2. The remaining unbounded reads: `grep_search` and `edit_file` whole-file
+   reads, `context_lines`, plus the `edit_file` context and non-atomic
+   writes, as one builtin pass.
+3. The MCP config Mediums together: `disabled`, `headers`, `timeout_ms`,
+   and serial warmup; `inherit_env` from `8077806` added a config field, so
+   extend that same table.
+4. `backend.go` items: streaming deadline, models negative cache, redirect
+   key replay.
+5. The small rest: static symlink, appconf value parsing, and the Low list.
 
 ---
 
-## Remediation log (2026-10-06, same day)
+## Remediation log (2026-10-06)
 
-The three Critical findings are fixed, live-verified, and re-verified against
-the current HEAD after a concurrent timings commit and a history rewrite
-landed on top. Commits: `d433d7b` (finding 1), `1cf2c83` (findings 2 and 3).
-The full suite passes: `gofmt`, `go build`, `go vet`,
-`go test -race -count=1 ./...`, all ten packages.
+Round one fixed the three Critical findings, live-verified and
+re-verified against HEAD after a concurrent timings commit and a history
+rewrite landed on top. Commits: `d433d7b` (finding 1), `1cf2c83`
+(findings 2 and 3). Round two fixed findings 4 to 9 (`5f7d71f` through
+`3ac16f8`), documented below. After each round the full suite passed:
+`gofmt`, `go build`, `go vet`, `go test -race -count=1 ./...`, ten
+packages.
 
 ### Finding 1: unbounded read (fixed)
 
@@ -415,14 +428,48 @@ Tests updated with the behavior: the two router assertions that pinned the
 wildcard now assert its absence; the guard matrix, target floor, key gate,
 redirect relay, and end-to-end CORS cases are new.
 
-### Not addressed in this round
+### Round two: findings 4 to 9
 
-Findings 4 to 9 and the Medium/Low items stay open; a second sweep of the
-current tree on 2026-10-06 confirmed each one still reproduces in code, and
-the Status lines mark them. Fixed as side effects: the `read_file` TOCTOU and
-the preflight `api-key` mismatch. One note for whoever takes the rest: `mcpx`
-publishes `Permissions.Write: false` for every MCP tool, so `toolsGuard`
-covers built-ins only until that field reads the real annotations.
+Each fix has a regression test, and each test was confirmed to fail
+against the pre-fix code (a mutation check by the fixing agent, or an
+explicit old-code comparison noted below).
+
+- `5f7d71f` (finding 4): usage chunks carrying content, reasoning, or
+  tool-call deltas stream through with live timings; usage-only closing
+  chunks keep the pinned hold-and-attach behavior byte for byte. The Node
+  reference proxy (`server/adapter.mjs:481-485`) still carries the defect.
+- `5da2b1b` (findings 5 and 6): one-second kill grace, then the alarm path
+  closes the pipe read end, because a setsid-detached grandchild holds its
+  inherited write end open and EOF never arrives; a timed-out result
+  reports the timeout only; children start from the ten-name allowlist.
+  Live against the built binary: the setsid bomb returns in 2.0 s on
+  timeout 1 with pre-timeout output kept, and both fake secrets expand
+  empty while PATH and HOME survive.
+- `8077806` (finding 6, MCP half): stdio children always get an explicit
+  environment (allowlist plus config entries, sorted for stability);
+  `"inherit_env": true` is the per-server opt-back-in.
+- `2d1fd48` (finding 9): failed (pattern, name) states are memoized, so
+  work is polynomial with identical accept/reject semantics, proven against
+  the old recursion over 327,670 pattern/name pairs with zero differences.
+  Live: the 16-pair bomb answers instantly.
+- `a33b031` (finding 7): the merged registry answers from live owners per
+  call; the HTTP-level test shows a revoked tool flipping from callable to
+  404 without a rebuild.
+- `3ac16f8` (finding 8): 16 MiB /tools body cap, 64 MiB relay cap, a
+  32-slot non-blocking relay semaphore with immediate refusal, and
+  ReadHeader/Read/Idle timeouts on the server, with WriteTimeout left
+  zero so streams stay open. Live: a 20 MiB body is refused in
+  milliseconds.
+
+### Not addressed
+
+The Medium and Low items remain open, marked in their sections. Fixed as
+side effects by now: the `read_file` TOCTOU and the preflight `api-key`
+mismatch (round one), and the `read_file` context case of the
+request-context Medium (round two). One note for whoever takes the rest:
+`mcpx` still publishes `Permissions.Write: false` for every MCP tool, so
+`toolsGuard` covers built-ins only until that field reads the real
+annotations.
 
 ### Unrelated concurrent work
 
