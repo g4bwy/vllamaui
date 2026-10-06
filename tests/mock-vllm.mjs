@@ -7,6 +7,8 @@
 //
 // Query and header switches on /v1/chat/completions:
 //   "truncate": true            stop mid-stream, no [DONE]
+//   "tool_batch": true          stream tool calls numbered globally, split by a
+//                               content chunk (the shape that broke the webui)
 //   X-Mock-Status: 400          answer with an OpenAI-style error body
 import http from 'node:http';
 
@@ -125,6 +127,31 @@ const server = http.createServer(async (req, res) => {
 	const key = JSON.stringify(parsed.messages ?? '');
 	const cached = seenPrompts.has(key) ? Math.round(prompt * 0.9) : 0;
 	seenPrompts.set(key, prompt);
+
+	// "tool_batch": true replays the frame order that broke the webui: vLLM
+	// numbers the calls globally, and a stray newline splits them into two
+	// batches. See server/adapter.mjs, renumberDeltaToolCalls.
+	if (parsed.tool_batch === true && parsed.stream) {
+		res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+		const frame = (delta) => res.write(`data: ${JSON.stringify({ id: 'mock-tools', model: parsed.model, choices: [{ index: 0, delta, finish_reason: null }] })}\n\n`);
+		const call = (index, part) => frame({ tool_calls: [{ index, ...part }] });
+		frame({ role: 'assistant', content: '' });
+		frame({ reasoning: 'I need two searches' });
+		frame({ reasoning: 'one for tech, one for world news' });
+		frame({ content: 'Let me look that up. ' });
+		call(0, { id: 'call_a', type: 'function', function: { name: 'search_news', arguments: '' } });
+		call(0, { function: { arguments: '{"query":"tech' } });
+		call(0, { function: { arguments: '"}' } });
+		frame({ content: '\n' });
+		call(1, { id: 'call_b', type: 'function', function: { name: 'search_news', arguments: '' } });
+		call(1, { function: { arguments: '{"query":"world' } });
+		call(1, { function: { arguments: ' news"}' } });
+		res.write(`data: ${JSON.stringify({ id: 'mock-tools', model: parsed.model, choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] })}\n\n`);
+		recordRequest(prompt, prompt - cached, cached, 12);
+		res.write(`data: ${JSON.stringify({ id: 'mock-tools', model: parsed.model, choices: [], usage: { prompt_tokens: prompt, completion_tokens: 12, total_tokens: prompt + 12 } })}\n\n`);
+		res.write('data: [DONE]\n\n');
+		return res.end();
+	}
 
 	if (parsed.stream) {
 		res.writeHead(200, { 'Content-Type': 'text/event-stream' });

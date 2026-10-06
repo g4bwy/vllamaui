@@ -124,7 +124,7 @@ func (p *Proxy) Complete(w http.ResponseWriter, r *http.Request) {
 			WriteMessage(w, http.StatusBadGateway, fmt.Sprintf("the %s backend returned unreadable JSON", b.ID()))
 			return
 		}
-		WriteJSON(w, http.StatusOK, mapMessageReasoning(payload))
+		WriteJSON(w, http.StatusOK, renumberMessageToolCalls(mapMessageReasoning(payload)))
 		return
 	}
 
@@ -165,6 +165,7 @@ func (w *window) wait() { <-w.done }
 func (p *Proxy) stream(ctx context.Context, w http.ResponseWriter, upstream *http.Response, out map[string]any, needWindow bool, win *window, tSend time.Time) {
 	d, b := p.d, p.b
 	st := &backend.Stream{}
+	batch := &backend.ToolBatch{}
 	var pending map[string]any // the usage chunk, held for the final timings
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache, no-transform")
@@ -221,6 +222,8 @@ func (p *Proxy) stream(ctx context.Context, w http.ResponseWriter, upstream *htt
 			return nil
 		}
 		b.RewriteChunk(chunk, st)
+		// after the backend rewrite, so a renamed reasoning field counts as text
+		batch.Delta(backend.Obj(backend.FirstChoice(chunk), "delta"))
 
 		if usage := backend.Obj(chunk, "usage"); usage != nil {
 			// held back until the post-request snapshot, then sent last
@@ -324,6 +327,14 @@ func mapMessageReasoning(payload map[string]any) map[string]any {
 		msg["reasoning_content"] = r
 		delete(msg, "reasoning")
 	}
+	return payload
+}
+
+// renumberMessageToolCalls puts the complete calls of a non-streamed answer in
+// the batch-relative convention the webui reads. Such an answer is one batch.
+func renumberMessageToolCalls(payload map[string]any) map[string]any {
+	var batch backend.ToolBatch
+	batch.Renumber(backend.Arr(backend.Obj(backend.FirstChoice(payload), "message"), "tool_calls"))
 	return payload
 }
 

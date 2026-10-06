@@ -7,13 +7,17 @@ const URL = process.env.UI_URL || 'http://localhost:8085/';
 const FILE = process.env.TOOL_FILE || 'go.mod';
 const ASK = process.env.TOOL_ASK ||
 	`Use the read_file tool to read the file "${FILE}" and tell me the module name declared in it. Answer with the module name only.`;
+const TOOL = process.env.TOOL_NAME || 'read_file';
 const EXPECT = process.env.TOOL_EXPECT || 'llama-webui/server';
+// the answer text is only assertable against a scripted engine; skip with
+// TOOL_EXPECT=skip when the model produces live content
 
 const browser = await chromium.launch({ args: ['--no-sandbox', '--disable-dev-shm-usage'] });
 const page = await browser.newPage({ viewport: { width: 1400, height: 950 } });
 
 const problems = [];
 const toolCalls = [];
+const callIds = new Set();
 const toolPosts = [];
 page.on('pageerror', (e) => problems.push('pageerror: ' + e.message.slice(0, 160)));
 page.on('response', async (res) => {
@@ -34,6 +38,7 @@ page.on('response', async (res) => {
 					const c = JSON.parse(line.slice(5));
 					for (const tc of c.choices?.[0]?.delta?.tool_calls ?? []) {
 						if (tc.function?.name) toolCalls.push(tc.function.name);
+						if (tc.id) callIds.add(tc.id);
 					}
 				} catch {}
 			}
@@ -81,7 +86,15 @@ for (let i = 0; i < 150; i++) {
 await page.screenshot({ path: 'shots/tools-answer.png', fullPage: true });
 
 const body = await page.locator('body').innerText();
-const gotToolCall = toolCalls.includes('read_file');
+// the tools panel probes the home directory once with file_glob_search; that is
+// the client's own discovery, not a call the model asked for
+const modelCalls = toolPosts.filter((p) => !/"tool":"file_glob_search"/.test(p.body || ''));
+const emptyNamed = toolCalls.filter((n) => !n || !n.trim()).length;
+const phantom = modelCalls.filter((p) => {
+	const m = /"tool":"([^"]*)"/.exec(p.body || '');
+	return !m || m[1] === '' || /"params":\{\s*\}/.test(p.body || '');
+}).length;
+const gotToolCall = toolCalls.includes(TOOL);
 const toolOk = toolPosts.some((p) => p.status === 200);
 const answered = body.toLowerCase().includes(EXPECT.toLowerCase());
 
@@ -91,9 +104,17 @@ for (const p of toolPosts) {
 	console.log(`POST /tools -> ${p.status}`, String(p.body || '').slice(0, 120));
 	console.log('   result:', p.result);
 }
+console.log('calls the model asked for:', toolCalls.length, '| distinct ids:', callIds.size, '| POSTs the client made:', modelCalls.length);
+console.log('tool calls with an empty name:', emptyNamed);
+console.log('phantom calls (no tool name or empty params):', phantom);
 console.log('tool result reached the UI:', toolOk);
-console.log(`answer contains ${EXPECT}:`, answered);
+if (EXPECT !== 'skip') console.log('answer contains ' + EXPECT + ':', answered);
 console.log('last lines:', JSON.stringify(body.split('\n').map((l) => l.trim()).filter(Boolean).slice(-6)));
 console.log('problems:', [...new Set(problems)].join(' | ') || '(none)');
 await browser.close();
-process.exit(gotToolCall && toolOk && answered && serverTools.length > 0 ? 0 : 1);
+const expectAnswer = EXPECT !== 'skip';
+// ids and posts can differ when the last round is still in flight against a
+// live engine, so the hard assertions are the two phantom counters
+const clean = emptyNamed === 0 && phantom === 0;
+if (modelCalls.length !== callIds.size) console.log('note: distinct ids', callIds.size, 'vs POSTs', modelCalls.length);
+process.exit(gotToolCall && toolOk && serverTools.length > 0 && clean && (!expectAnswer || answered) ? 0 : 1);

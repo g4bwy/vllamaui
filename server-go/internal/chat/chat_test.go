@@ -683,6 +683,352 @@ func TestClientDisconnectStopsTheEngine(t *testing.T) {
 	}
 }
 
+// ---------- tool call batches ----------
+
+// vLLM numbers delta.tool_calls across the whole completion. The webui restarts
+// its aggregation at 0 for every batch, a batch being the run of calls between
+// two text deltas. The cases below replay what one engine really sent.
+
+// toolChunk wraps one delta in the chunk envelope an engine sends.
+func toolChunk(delta string) string {
+	return `{"id":"c1","model":"qwen-test","choices":[{"index":0,"delta":` + delta + `,"finish_reason":null}]}`
+}
+
+// finishChunk carries no text: on its own it must not close or reset a batch.
+const finishChunk = `{"id":"c1","model":"qwen-test","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`
+
+const usageChunk = `{"id":"c1","model":"qwen-test","choices":[],"usage":{"prompt_tokens":10,"completion_tokens":9}}`
+
+// toolStream answers one completion with the given chunks.
+func toolStream(w http.ResponseWriter, chunks []string) {
+	w.Header().Set("Content-Type", "text/event-stream")
+	for _, c := range chunks {
+		fmt.Fprint(w, "data: "+c+"\n\n")
+	}
+	fmt.Fprint(w, "data: [DONE]\n\n")
+}
+
+// callDelta builds one delta that carries tool call fragments.
+func callDelta(entries ...string) string {
+	return `{"tool_calls":[` + strings.Join(entries, ",") + `]}`
+}
+
+// toolCase is one engine script and the tool call indexes the browser must see.
+// "-" means the entry must carry no index field at all.
+type toolCase struct {
+	name   string
+	chunks []string
+	want   []string
+}
+
+// regressionChunks is what vLLM really streamed for a prompt that asked for two
+// parallel searches: an empty content frame and a lone newline in between, and
+// the calls numbered 0 and 1 for the whole completion.
+var regressionChunks = []string{
+	toolChunk(`{"role":"assistant","content":""}`),
+	toolChunk(`{"reasoning":"I need two searches"}`),
+	toolChunk(`{"reasoning":"one for tech, one for world news"}`),
+	toolChunk(`{"content":"Looking it up. "}`),
+	toolChunk(callDelta(`{"index":0,"id":"call_a","type":"function","function":{"name":"search_news","arguments":""}}`)),
+	toolChunk(callDelta(`{"index":0,"function":{"arguments":"{\"query\":\"tech"}}`)),
+	toolChunk(callDelta(`{"index":0,"function":{"arguments":"\"}"}}`)),
+	toolChunk(`{"content":""}`),
+	toolChunk(`{"content":"\n"}`),
+	toolChunk(callDelta(`{"index":1,"id":"call_b","type":"function","function":{"name":"search_news","arguments":""}}`)),
+	toolChunk(callDelta(`{"index":1,"function":{"arguments":"{\"query\":\"world news"}}`)),
+	toolChunk(callDelta(`{"index":1,"function":{"arguments":"\"}"}}`)),
+	finishChunk,
+	usageChunk,
+}
+
+func TestStreamToolCallBatchIndexes(t *testing.T) {
+	cases := []toolCase{
+		{
+			// the live shape: two searches, asked for one after the other, split
+			// by a content chunk that holds nothing but a newline
+			name:   "regression: a newline between two calls",
+			chunks: regressionChunks,
+			want:   []string{"0", "0", "0", "0", "0", "0"},
+		},
+		{
+			name: "parallel calls inside one batch keep their indexes",
+			chunks: []string{
+				toolChunk(`{"reasoning":"two at once"}`),
+				toolChunk(callDelta(`{"index":0,"id":"call_a","function":{"name":"search","arguments":""}}`)),
+				toolChunk(callDelta(`{"index":1,"id":"call_b","function":{"name":"search","arguments":""}}`)),
+				toolChunk(callDelta(`{"index":0,"function":{"arguments":"{}"}}`)),
+				toolChunk(callDelta(`{"index":1,"function":{"arguments":"{}"}}`)),
+				finishChunk,
+				usageChunk,
+			},
+			want: []string{"0", "1", "0", "1"},
+		},
+		{
+			// each batch reuses raw 0 and 1, and each one gets a fresh pair
+			name: "a third batch reuses the raw indexes",
+			chunks: []string{
+				toolChunk(callDelta(`{"index":0,"id":"call_a","function":{"name":"one","arguments":""}}`)),
+				toolChunk(callDelta(`{"index":1,"id":"call_b","function":{"name":"two","arguments":""}}`)),
+				toolChunk(`{"content":"\n"}`),
+				toolChunk(callDelta(`{"index":0,"id":"call_c","function":{"name":"three","arguments":""}}`)),
+				toolChunk(callDelta(`{"index":1,"id":"call_d","function":{"name":"four","arguments":""}}`)),
+				toolChunk(`{"content":" and "}`),
+				toolChunk(callDelta(`{"index":0,"id":"call_e","function":{"name":"five","arguments":""}}`)),
+				toolChunk(callDelta(`{"index":1,"id":"call_f","function":{"name":"six","arguments":""}}`)),
+				finishChunk,
+				usageChunk,
+			},
+			want: []string{"0", "1", "0", "1", "0", "1"},
+		},
+		{
+			// the webui appends an index-less delta, so one must not be invented
+			name:   "an index-less delta stays index-less",
+			chunks: []string{toolChunk(`{"content":"text"}`), toolChunk(callDelta(`{"id":"call_a","function":{"name":"one","arguments":""}}`)), finishChunk, usageChunk},
+			want:   []string{"-"},
+		},
+		{
+			// the continuation lands on the slot its raw index already has, and
+			// the finish chunk before it resets nothing
+			name: "an arguments-only continuation joins its call",
+			chunks: []string{
+				toolChunk(callDelta(`{"index":0,"id":"call_a","function":{"name":"one","arguments":""}}`)),
+				toolChunk(callDelta(`{"index":1,"id":"call_b","function":{"name":"two","arguments":""}}`)),
+				toolChunk(`{"reasoning":"again"}`),
+				toolChunk(callDelta(`{"index":0,"id":"call_c","function":{"name":"three","arguments":""}}`)),
+				toolChunk(callDelta(`{"index":1,"id":"call_d","function":{"name":"four","arguments":"{\"a\":"}}`)),
+				finishChunk,
+				toolChunk(callDelta(`{"index":1,"function":{"arguments":"1}"}}`)),
+				usageChunk,
+			},
+			want: []string{"0", "1", "0", "1", "1"},
+		},
+		{
+			// llama-server restarts its indexes per batch already: untouched
+			name: "an engine that restarts per batch is passed through",
+			chunks: []string{
+				toolChunk(callDelta(`{"index":0,"id":"call_a","function":{"name":"one","arguments":""}}`)),
+				toolChunk(callDelta(`{"index":1,"id":"call_b","function":{"name":"two","arguments":""}}`)),
+				toolChunk(`{"content":"between"}`),
+				toolChunk(callDelta(`{"index":0,"id":"call_c","function":{"name":"three","arguments":""}}`)),
+				toolChunk(callDelta(`{"index":1,"id":"call_d","function":{"name":"four","arguments":""}}`)),
+				finishChunk,
+				usageChunk,
+			},
+			want: []string{"0", "1", "0", "1"},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := forwardedToolIndexes(t, tc.chunks)
+			if len(got) != len(tc.want) {
+				t.Fatalf("got %d tool call entries, want %d: %v", len(got), len(tc.want), got)
+			}
+			for i, want := range tc.want {
+				if got[i] != want {
+					t.Errorf("entry %d: index = %s, want %s (all: %v)", i, got[i], want, got)
+				}
+			}
+		})
+	}
+}
+
+// forwardedToolIndexes runs one engine script through the proxy and reports the
+// tool call indexes it sent on, in order, "-" where the field is absent.
+func forwardedToolIndexes(t *testing.T, chunks []string) []string {
+	t.Helper()
+	var out []string
+	for _, line := range forwardedChunks(t, chunks) {
+		for _, entry := range toolEntries(t, line) {
+			out = append(out, indexText(entry))
+		}
+	}
+	return out
+}
+
+// forwardedChunks returns the payloads the browser saw, [DONE] dropped.
+func forwardedChunks(t *testing.T, chunks []string) []string {
+	t.Helper()
+	fake := &fakeUpstream{models: modelsJSON, stream: func(w http.ResponseWriter, _ *http.Request) {
+		toolStream(w, chunks)
+	}}
+	tt := newTester(t, "vllm", fake, nil)
+	rec := tt.post(`{"messages":[{"role":"user","content":"what's in the news today?"}],"stream":true}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body %s", rec.Code, rec.Body)
+	}
+	var out []string
+	for _, line := range dataLines(rec.Body.String()) {
+		if line != "[DONE]" {
+			out = append(out, line)
+		}
+	}
+	return out
+}
+
+func toolEntries(t *testing.T, payload string) []map[string]any {
+	t.Helper()
+	d := backend.Obj(backend.FirstChoice(mustJSON(t, payload)), "delta")
+	var out []map[string]any
+	for _, raw := range backend.Arr(d, "tool_calls") {
+		m, ok := raw.(map[string]any)
+		if !ok {
+			t.Fatalf("a tool call delta is not an object: %v", raw)
+		}
+		out = append(out, m)
+	}
+	return out
+}
+
+// indexText renders the index field of one delta, "-" when it has none.
+func indexText(entry map[string]any) string {
+	raw, present := entry["index"]
+	if !present {
+		return "-"
+	}
+	if n, ok := raw.(json.Number); ok {
+		return n.String()
+	}
+	if v, ok := backend.Num(entry, "index"); ok {
+		return fmt.Sprintf("%g", v)
+	}
+	return fmt.Sprintf("%v", raw)
+}
+
+// TestStreamToolCallBatchGrouping is the symptom the user saw: the raw stream
+// leaves the webui with a third, empty tool call, the rewritten one does not.
+func TestStreamToolCallBatchGrouping(t *testing.T) {
+	chunks := regressionChunks
+
+	// taken straight from the engine, the numbering invents a call
+	if calls := webuiAggregate(t, chunks); len(calls) != 3 || calls[1] != nil {
+		t.Fatalf("the raw script must show the phantom call this fix is about, got %s", calls)
+	}
+
+	calls := webuiAggregate(t, forwardedChunks(t, chunks))
+	if len(calls) != 2 {
+		t.Fatalf("want two tool calls, got %s", calls)
+	}
+	want := []aggregatedCall{
+		{id: "call_a", name: "search_news", args: `{"query":"tech"}`},
+		{id: "call_b", name: "search_news", args: `{"query":"world news"}`},
+	}
+	for i, c := range calls {
+		if c == nil {
+			t.Fatalf("call %d is an empty entry, which the UI asks the user to approve", i)
+		}
+		if *c != want[i] {
+			t.Errorf("call %d = %s, want %s", i, c, want[i].String())
+		}
+	}
+}
+
+// aggregatedCall is one tool call as the webui builds it out of the deltas.
+type aggregatedCall struct {
+	id   string
+	name string
+	args string
+}
+
+func (c *aggregatedCall) String() string {
+	if c == nil {
+		return "<empty>"
+	}
+	return c.id + " " + c.name + " " + c.args
+}
+
+// webuiAggregate replays the aggregation of chat.service.ts: a non-empty
+// content or reasoning_content delta closes the open batch and moves the index
+// offset to the number of calls collected so far, and a delta lands on index +
+// offset. A jump pads the gap with a call that has no function, which is the
+// phantom entry: it comes back as nil here.
+func webuiAggregate(t *testing.T, payloads []string) []*aggregatedCall {
+	t.Helper()
+	var calls []*aggregatedCall
+	offset, open := 0, false
+	for _, p := range payloads {
+		d := backend.Obj(backend.FirstChoice(mustJSON(t, p)), "delta")
+		if backend.Str(d, "content") != "" || backend.Str(d, "reasoning_content") != "" {
+			if open {
+				offset, open = len(calls), false
+			}
+		}
+		for _, entry := range toolEntries(t, p) {
+			at := len(calls)
+			if _, present := entry["index"]; present {
+				if v, ok := backend.Num(entry, "index"); ok && v >= 0 {
+					at = int(v) + offset
+				}
+			}
+			for len(calls) <= at {
+				calls = append(calls, nil)
+			}
+			slot := calls[at]
+			if slot == nil {
+				slot = &aggregatedCall{}
+				calls[at] = slot
+			}
+			if id := backend.Str(entry, "id"); id != "" {
+				slot.id = id
+			}
+			if fn := backend.Obj(entry, "function"); fn != nil {
+				if name := backend.Str(fn, "name"); name != "" {
+					slot.name = name
+				}
+				if args := backend.Str(fn, "arguments"); args != "" {
+					slot.args += args
+				}
+			}
+			open = true
+		}
+	}
+	return calls
+}
+
+// TestNonStreamToolCallIndexes covers the answer that arrives in one piece: the
+// calls are a single batch, so they restart at 0.
+func TestNonStreamToolCallIndexes(t *testing.T) {
+	fake := &fakeUpstream{models: modelsJSON, stream: func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"id":"c1","choices":[{"index":0,"message":{"role":"assistant","content":"","tool_calls":[`+
+			`{"index":3,"id":"call_a","function":{"name":"one","arguments":"{}"}},`+
+			`{"index":4,"id":"call_b","function":{"name":"two","arguments":"{}"}}]}}]}`)
+	}}
+	tt := newTester(t, "vllm", fake, nil)
+	rec := tt.post(`{"messages":[],"stream":false}`)
+
+	choices := backend.Arr(mustJSON(t, rec.Body.String()), "choices")
+	if len(choices) != 1 {
+		t.Fatalf("one choice expected: %s", rec.Body)
+	}
+	entries := toolEntriesMap(t, backend.Obj(choices[0].(map[string]any), "message"))
+	if len(entries) != 2 {
+		t.Fatalf("the tool calls must survive the rewrite: %s", rec.Body)
+	}
+	for i, want := range []string{"0", "1"} {
+		if got := indexText(entries[i]); got != want {
+			t.Errorf("call %d: index = %s, want %s", i, got, want)
+		}
+	}
+	if backend.Str(backend.Obj(entries[0], "function"), "name") != "one" {
+		t.Errorf("no other field may change: %v", entries[0])
+	}
+}
+
+// toolEntriesMap reads the complete calls of a message.
+func toolEntriesMap(t *testing.T, msg map[string]any) []map[string]any {
+	t.Helper()
+	var out []map[string]any
+	for _, raw := range backend.Arr(msg, "tool_calls") {
+		m, ok := raw.(map[string]any)
+		if !ok {
+			t.Fatalf("a tool call is not an object: %v", raw)
+		}
+		out = append(out, m)
+	}
+	return out
+}
+
 // closingWriter is a response writer whose client has vanished.
 type closingWriter struct {
 	mu   sync.Mutex

@@ -23,3 +23,6 @@ frontend/test-results/
 # go build output
 server-go/webui
 server-go/mcp-fixture
+
+# local MCP test config with real endpoints and credentials: never commit
+mcp.json

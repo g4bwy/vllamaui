@@ -281,6 +281,51 @@ function round1(n) {
 	return Math.round(n * 10) / 10;
 }
 
+// The webui numbers tool calls per batch (chat.service.ts: a content or
+// reasoning delta closes the open batch, the next call starts again at index 0).
+// vLLM numbers them across the whole completion, so a call after a stray text
+// chunk lands past its slot and the UI pads the gap with an empty tool call.
+// Renumber to the convention the UI reads.
+function newToolBatch() {
+	return { slots: new Map(), next: 0 };
+}
+
+// The first raw index seen in a batch takes the next free slot, later deltas of
+// that call keep it. Indexes that already restart per batch come out unchanged.
+// A delta with no index stays index-less: the UI appends those, so inventing an
+// index would change what it does.
+function renumberToolCalls(calls, batch) {
+	if (!Array.isArray(calls)) return;
+	for (const c of calls) {
+		if (!c || typeof c.index !== 'number' || c.index < 0) continue;
+		let slot = batch.slots.get(c.index);
+		if (slot === undefined) {
+			slot = batch.next;
+			batch.next += 1;
+			batch.slots.set(c.index, slot);
+		}
+		c.index = slot;
+	}
+}
+
+function renumberDeltaToolCalls(chunk, batch) {
+	const d = chunk.choices?.[0]?.delta;
+	if (!d) return;
+	// only real text closes a batch, an empty content frame does not
+	const text = (typeof d.content === 'string' && d.content.length) || (typeof d.reasoning_content === 'string' && d.reasoning_content.length);
+	if (text) {
+		batch.slots.clear();
+		batch.next = 0;
+	}
+	renumberToolCalls(d.tool_calls, batch);
+}
+
+// A non-streamed answer carries complete calls: one batch.
+function renumberMessageToolCalls(payload) {
+	renumberToolCalls(payload?.choices?.[0]?.message?.tool_calls, newToolBatch());
+	return payload;
+}
+
 async function handleChat(req, res) {
 	let body;
 	try {
@@ -343,7 +388,7 @@ async function handleChat(req, res) {
 	}
 
 	if (!out.stream) {
-		const json = mapMessageReasoning(await upstream.json());
+		const json = renumberMessageToolCalls(mapMessageReasoning(await upstream.json()));
 		return sendJson(res, 200, json);
 	}
 
@@ -354,7 +399,7 @@ async function handleChat(req, res) {
 		'X-Accel-Buffering': 'no'
 	});
 
-	const st = { firstAt: 0, lastAt: 0, tokens: 0, usage: null, sawDone: false, truncated: false };
+	const st = { firstAt: 0, lastAt: 0, tokens: 0, usage: null, sawDone: false, truncated: false, toolBatch: newToolBatch() };
 	const pre = await prePromise;
 	const decoder = new TextDecoder();
 	let buf = '';
@@ -430,6 +475,8 @@ async function handleChat(req, res) {
 			return;
 		}
 		backend.rewriteChunk(chunk, st);
+		// after the rename, so vLLM's reasoning field is seen as text too
+		renumberDeltaToolCalls(chunk, st.toolBatch);
 
 		if (chunk.usage) {
 			st.usage = chunk.usage;

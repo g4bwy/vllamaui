@@ -240,6 +240,59 @@ type Stream struct {
 	Truncated bool
 }
 
+// ToolBatch renumbers delta.tool_calls into the convention the webui
+// aggregates with: a content or reasoning delta closes the open batch, and the
+// next call restarts at index 0. vLLM numbers the calls across the whole
+// completion instead, so a call after a stray text chunk lands past its slot
+// and the UI pads the gap with an empty tool call.
+type ToolBatch struct {
+	slots map[float64]int
+	next  int
+}
+
+// Reset closes the current batch.
+func (t *ToolBatch) Reset() {
+	t.slots = nil
+	t.next = 0
+}
+
+// Renumber gives every raw index the slot of its batch, in order of first
+// appearance, in place. A call with no index is left index-less: the UI appends
+// those, so inventing an index would change what it does. Raw indexes that
+// already restart per batch come out unchanged.
+func (t *ToolBatch) Renumber(calls []any) {
+	for _, c := range calls {
+		m, ok := c.(map[string]any)
+		if !ok {
+			continue
+		}
+		raw, present := m["index"]
+		index, isNum := numOf(raw)
+		if !present || !isNum || index < 0 {
+			continue
+		}
+		slot, seen := t.slots[index]
+		if !seen {
+			slot = t.next
+			t.next++
+			if t.slots == nil {
+				t.slots = map[float64]int{}
+			}
+			t.slots[index] = slot
+		}
+		m["index"] = slot
+	}
+}
+
+// Delta applies the batch rule to one streamed delta. Text seen here closes the
+// open batch before this chunk's calls are numbered.
+func (t *ToolBatch) Delta(delta map[string]any) {
+	if Str(delta, "content") != "" || Str(delta, "reasoning_content") != "" {
+		t.Reset()
+	}
+	t.Renumber(Arr(delta, "tool_calls"))
+}
+
 // SnapshotOpts steers a metrics read. A window around a request must read fresh,
 // or the two snapshots are the same cached scrape and the delta is zero.
 type SnapshotOpts struct {
@@ -587,18 +640,23 @@ func readAll(r io.Reader) (string, error) {
 
 // Num reads a JSON number that may have arrived as json.Number.
 func Num(m map[string]any, k string) (float64, bool) {
-	switch v := m[k].(type) {
+	return numOf(m[k])
+}
+
+// numOf coerces one decoded value the way Num does.
+func numOf(v any) (float64, bool) {
+	switch t := v.(type) {
 	case json.Number:
-		f, err := v.Float64()
+		f, err := t.Float64()
 		return f, err == nil
 	case float64:
-		return v, true
+		return t, true
 	case int:
-		return float64(v), true
+		return float64(t), true
 	case int64:
-		return float64(v), true
+		return float64(t), true
 	case bool:
-		if v {
+		if t {
 			return 1, true
 		}
 		return 0, true
