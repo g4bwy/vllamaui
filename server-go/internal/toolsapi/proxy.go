@@ -21,6 +21,15 @@ const (
 
 	// proxyTimeout is the 600 s read/write bound llama-server gives the relay.
 	proxyTimeout = 600 * time.Second
+
+	// relayMaxBody bounds one relay body. The browser posts MCP messages and
+	// reads, and nothing legitimate comes close to this.
+	relayMaxBody = 64 << 20
+
+	// relayCapacity is how many relays may run at once. A request that arrives
+	// while all of them are busy is refused rather than queued, so one stalled
+	// upstream cannot pile up connections and goroutines here.
+	relayCapacity = 32
 )
 
 // Proxy is the CORS relay the browser uses to reach remote MCP servers.
@@ -33,6 +42,9 @@ type Proxy struct {
 	all     bool
 	log     Log
 	client  *http.Client
+	// relay holds one token per running relay. NewProxy fills it to
+	// relayCapacity; Handle takes a token and gives it back when the relay ends.
+	relay chan struct{}
 	// allow gates the route, set by Keys. nil means no key was configured.
 	allow func(*http.Request) bool
 }
@@ -64,7 +76,30 @@ func NewProxy(allowed []string, logf Log) *Proxy {
 		}
 		p.allowed[o] = true
 	}
+	p.relay = make(chan struct{}, relayCapacity)
 	return p
+}
+
+// acquireRelay takes one relay slot. It never waits: at capacity the caller is
+// refused outright, so requests do not queue behind a stalled upstream.
+func (p *Proxy) acquireRelay() bool {
+	if p.relay == nil {
+		return true // a Proxy with no slot channel is not bounded
+	}
+	select {
+	case p.relay <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+// releaseRelay gives back the slot acquireRelay took.
+func (p *Proxy) releaseRelay() {
+	if p.relay == nil {
+		return
+	}
+	<-p.relay
 }
 
 // Keys gates Handle: allow reports whether a request may use the relay. It
@@ -129,7 +164,20 @@ func (p *Proxy) Handle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	body, err := io.ReadAll(r.Body)
+	// The slot is taken before the body is read: a request that cannot be served
+	// must not make this server hold a body for nothing. It goes back when Handle
+	// returns, which is when the relay has finished copying the response.
+	if !p.acquireRelay() {
+		p.log("proxy at capacity, dropping a request to %s", target.Redacted())
+		p.fail(w, r, http.StatusInternalServerError, kindServer, "proxy at capacity")
+		return
+	}
+	defer p.releaseRelay()
+
+	// MaxBytesReader stops the read at the cap instead of letting a client make
+	// this server allocate a body it will never use. The failure takes the same
+	// path as any other unreadable body.
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, relayMaxBody))
 	if err != nil {
 		p.fail(w, r, http.StatusBadRequest, kindInvalidRequest, "failed to read request body: "+err.Error())
 		return

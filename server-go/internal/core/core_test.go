@@ -1124,3 +1124,39 @@ func disabledReason(b map[string]any) string {
 	}
 	return ""
 }
+
+// A slow or dead client must not be able to hold a connection and its goroutine
+// forever, so the bound server carries the timeouts.
+func TestBoundServerHasRequestTimeouts(t *testing.T) {
+	h := newHarness(t, "vllm", newEngine(map[string]string{}), nil)
+	if err := h.s.Bind(); err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+	h.s.mu.Lock()
+	srv := h.s.httpSrv
+	ln := h.s.listener
+	h.s.mu.Unlock()
+	if ln != nil {
+		defer ln.Close()
+	}
+	if srv == nil {
+		t.Fatal("Bind did not build the http.Server")
+	}
+	for _, c := range []struct {
+		name string
+		got  time.Duration
+		want time.Duration
+	}{
+		{"ReadHeaderTimeout", srv.ReadHeaderTimeout, 15 * time.Second},
+		{"ReadTimeout", srv.ReadTimeout, 60 * time.Second},
+		{"IdleTimeout", srv.IdleTimeout, 120 * time.Second},
+	} {
+		if c.got != c.want {
+			t.Errorf("%s = %s, want %s", c.name, c.got, c.want)
+		}
+	}
+	// Writing the response is not bounded: an SSE stream has to keep going.
+	if srv.WriteTimeout != 0 {
+		t.Errorf("WriteTimeout = %s, want 0 so a stream is not cut short", srv.WriteTimeout)
+	}
+}

@@ -95,7 +95,15 @@ func (s *Server) Bind() error {
 	}
 	s.mu.Lock()
 	s.listener = ln
-	s.httpSrv = &http.Server{Handler: s.Handler()}
+	// The timeouts stop a slow or dead client from holding a connection and its
+	// goroutine forever. ReadTimeout bounds reading the request only, so the
+	// long-lived SSE responses are unaffected.
+	s.httpSrv = &http.Server{
+		Handler:           s.Handler(),
+		ReadHeaderTimeout: 15 * time.Second,
+		ReadTimeout:       60 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
 	s.mu.Unlock()
 	return nil
 }

@@ -40,6 +40,10 @@ const (
 	hdrToolCwd     = "x-tool-cwd"
 	hdrToolRuntime = "x-tool-runtime"
 	hdrRespType    = "x-resp-type"
+
+	// maxCallBodyBytes bounds one POST /tools body. A base64 read_file result
+	// carried inside a write_file param still fits comfortably.
+	maxCallBodyBytes = 16 << 20
 )
 
 const (
@@ -183,7 +187,10 @@ func (a *API) canStream(name string) bool {
 func (a *API) readCall(w http.ResponseWriter, r *http.Request) (contracts.ToolRequest, string, bool) {
 	var req contracts.ToolRequest
 
-	body, err := io.ReadAll(r.Body)
+	// MaxBytesReader stops the read at the cap instead of letting a client make
+	// this server allocate a body it will never use. The failure takes the same
+	// path as any other unreadable body.
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxCallBodyBytes))
 	if err != nil {
 		writeFlat(w, http.StatusBadRequest, http.StatusBadRequest,
 			"failed to read request body: "+err.Error(), kindInvalidRequest)
