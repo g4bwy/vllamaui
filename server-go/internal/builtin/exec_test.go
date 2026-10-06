@@ -4,8 +4,11 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -130,11 +133,67 @@ func TestExecShellCommandTimeout(t *testing.T) {
 	if elapsed > 5*time.Second {
 		t.Errorf("the command ran %v, the timeout did not stop it", elapsed)
 	}
-	want := "\n[exit code: 1] [exit due to timed out]"
+	want := "\n[exit due to timed out]"
 	if res.PlainText != want {
 		t.Errorf("output = %q, want %q", res.PlainText, want)
 	}
 	assertNoProcess(t, "timeoutmarker.sh")
+}
+
+// TestExecShellCommandTimeoutDetachedGrandchild: the alarm kills the process
+// group, but a grandchild that left the group with setsid still holds the write
+// end of the output pipe, so waiting for EOF alone keeps the handler alive for
+// as long as that stray runs. The read end is shut after a short grace instead.
+func TestExecShellCommandTimeoutDetachedGrandchild(t *testing.T) {
+	if _, err := exec.LookPath("setsid"); err != nil {
+		t.Skip("setsid is not available")
+	}
+	root := t.TempDir()
+	s := newSet(t, root)
+
+	// the stray is on purpose: it sits outside the killed group, so the test
+	// notes its pid and tidies it up itself
+	start := time.Now()
+	res := call(t, s, root, "exec_shell_command", map[string]any{
+		"command": "setsid sleep 12 & echo $! > stray.pid; echo started; exit 0",
+		"timeout": float64(1),
+	})
+	elapsed := time.Since(start)
+	killStray(t, root)
+
+	if elapsed > 4*time.Second {
+		t.Errorf("the call returned after %v, the timeout did not end it", elapsed)
+	}
+	if !strings.Contains(res.PlainText, "[exit due to timed out]") {
+		t.Errorf("output = %q, want the timeout reported", res.PlainText)
+	}
+	if strings.Contains(res.PlainText, "[exit code:") {
+		t.Errorf("output = %q, a timed out call must report the timeout alone", res.PlainText)
+	}
+	if !strings.Contains(res.PlainText, "started") {
+		t.Errorf("output = %q, the text written before the alarm is missing", res.PlainText)
+	}
+}
+
+// TestExecShellCommandEnvironment: a child sees the allowlist, never the whole
+// server environment. The command below is the attack: the model asks for the
+// environment and the answer lands in its context.
+func TestExecShellCommandEnvironment(t *testing.T) {
+	root := t.TempDir()
+	s := newSet(t, root)
+	t.Setenv("UPSTREAM_API_KEY", "sk-not-for-the-child")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "sk-secret-also-not")
+	t.Setenv("LANG", "en_US.UTF-8") // on the allowlist, so it must come through
+
+	res := call(t, s, root, "exec_shell_command", map[string]any{
+		"command": `echo "key=${UPSTREAM_API_KEY}"; echo "secret=${AWS_SECRET_ACCESS_KEY}"; ` +
+			`echo "lang=${LANG}"; test -n "${PATH}" && echo "path is set"`,
+	})
+
+	want := "key=\nsecret=\nlang=en_US.UTF-8\npath is set\n\n[exit code: 0]"
+	if res.PlainText != want {
+		t.Errorf("output = %q, want %q", res.PlainText, want)
+	}
 }
 
 // TestExecShellCommandZeroTimeout: llama-server arms its watchdog with the
@@ -148,7 +207,7 @@ func TestExecShellCommandZeroTimeout(t *testing.T) {
 	if elapsed := time.Since(start); elapsed > 5*time.Second {
 		t.Errorf("the command ran %v", elapsed)
 	}
-	if want := "\n[exit code: 1] [exit due to timed out]"; res.PlainText != want {
+	if want := "\n[exit due to timed out]"; res.PlainText != want {
 		t.Errorf("output = %q, want %q", res.PlainText, want)
 	}
 	assertNoProcess(t, "sleep 25")
@@ -161,7 +220,7 @@ func TestExecShellCommandNegativeTimeout(t *testing.T) {
 	s := newSet(t, root)
 
 	res := call(t, s, root, "exec_shell_command", map[string]any{"command": "sleep 26", "timeout": float64(-5)})
-	if !strings.HasSuffix(res.PlainText, " [exit due to timed out]") {
+	if res.PlainText != "\n[exit due to timed out]" {
 		t.Errorf("output = %q, want the timed out tail", res.PlainText)
 	}
 	assertNoProcess(t, "sleep 26")
@@ -338,6 +397,23 @@ func assertNoProcess(t *testing.T, marker string) {
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
+}
+
+// killStray stops the detached process a test left behind, which no group kill
+// reaches. The pid file names setsid's own pid: it execs the program directly
+// unless it has to fork, and both spells are tried.
+func killStray(t *testing.T, dir string) {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join(dir, "stray.pid"))
+	if err != nil {
+		return // the shell never got that far
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(raw)))
+	if err != nil || pid <= 1 {
+		return
+	}
+	_ = syscall.Kill(-pid, syscall.SIGKILL)
+	_ = syscall.Kill(pid, syscall.SIGKILL)
 }
 
 func runningWith(marker string) []string {
