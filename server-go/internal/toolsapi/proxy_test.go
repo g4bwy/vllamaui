@@ -548,3 +548,138 @@ func TestProxyBodyReadError(t *testing.T) {
 		t.Errorf("body = %s", rec.Body)
 	}
 }
+
+// TestProxyTargetRefusesLinkLocalAndMetadata: the relay must never fetch the
+// addresses that hand back credentials for the machine it runs on. Loopback and
+// private space stay allowed: a local MCP server is what the route is for.
+func TestProxyTargetRefusesLinkLocalAndMetadata(t *testing.T) {
+	p := NewProxy([]string{"http://ui.test"}, testLog(t))
+
+	blocked := []struct{ url, why string }{
+		{"http://169.254.169.254/latest/meta-data/iam/", "169.254.169.254 is a link-local address"}, // the AWS metadata endpoint
+		{"http://169.254.1.1/mcp", "169.254.1.1 is a link-local address"},
+		{"http://[fe80::1]:8080/mcp", "fe80::1 is a link-local address"}, // IPv6 link-local
+		{"http://[fe80::dead:beef]/mcp", "fe80::dead:beef is a link-local address"},
+		{"http://[fd00:ec2::254]/mcp", "fd00:ec2::254 is the AWS IPv6 metadata address"},
+		{"http://metadata.google.internal/computeMetadata/v1/", "metadata.google.internal is a cloud metadata host name"},
+		{"http://METADATA.GOOGLE.INTERNAL/computeMetadata/v1/", "metadata.google.internal is a cloud metadata host name"},
+	}
+	for _, tc := range blocked {
+		rec := proxyReq(t, p, http.MethodGet, tc.url, "", nil)
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("%s = %d, want 400: %s", tc.url, rec.Code, rec.Body)
+			continue
+		}
+		if !strings.Contains(rec.Body.String(), `"type":"invalid_request_error"`) ||
+			!strings.Contains(rec.Body.String(), "target address is not allowed: "+tc.why) {
+			t.Errorf("%s body = %s, want the reason %q", tc.url, rec.Body, tc.why)
+		}
+	}
+
+	for _, raw := range []string{
+		"http://127.0.0.1:1/mcp",
+		"http://[::1]:9/mcp",
+		"http://localhost:3000/mcp",
+		"http://10.0.0.7:8080/mcp",
+		"http://mcp.example.test:8443/mcp",
+	} {
+		if _, err := proxyTarget(raw); err != nil {
+			t.Errorf("proxyTarget(%s) = %v, want it accepted", raw, err)
+		}
+	}
+}
+
+// TestProxyKeysGate: with a key configured, /cors-proxy stops being an open relay.
+func TestProxyKeysGate(t *testing.T) {
+	u := newUpstream(t, http.StatusOK, "ok", "text/plain")
+	target := "http://" + strings.TrimPrefix(u.server.URL, "http://") + "/mcp"
+
+	p := NewProxy([]string{"http://ui.test"}, testLog(t))
+	p.Keys(func(r *http.Request) bool { return r.Header.Get("X-Api-Key") == "secret" })
+
+	rec := proxyReq(t, p, http.MethodGet, target, "", nil)
+	wantBody(t, rec, http.StatusUnauthorized,
+		`{"error":{"message":"Invalid API Key","type":"authentication_error","code":401}}`)
+	if u.nHits() != 0 {
+		t.Error("a request without the key must not reach the target")
+	}
+
+	// The preflight is gated as well: the route describes itself to callers that
+	// can use it, and to nobody else.
+	rec = proxyReq(t, p, http.MethodOptions, target, "", map[string]string{"Origin": "http://ui.test"})
+	if rec.Code != http.StatusUnauthorized {
+		t.Errorf("preflight = %d, want 401", rec.Code)
+	}
+
+	rec = proxyReq(t, p, http.MethodPost, target, `{"jsonrpc":"2.0"}`,
+		map[string]string{"X-Api-Key": "secret", "Origin": "http://ui.test"})
+	if rec.Code != http.StatusOK || rec.Body.String() != "ok" {
+		t.Errorf("with the key: status = %d body %s", rec.Code, rec.Body)
+	}
+	if u.nHits() == 0 {
+		t.Error("the keyed request must reach the target")
+	}
+
+	// Never calling Keys leaves the relay open, like a server with no --api-key.
+	if rec := proxyReq(t, NewProxy([]string{"http://ui.test"}, testLog(t)), http.MethodGet, target, "", nil); rec.Code != http.StatusOK {
+		t.Errorf("ungated = %d, want the relay to work", rec.Code)
+	}
+	// A nil Proxy keeps answering 403 rather than panicking on the gate.
+	if got := (*Proxy)(nil).Keys(nil); got != nil {
+		t.Error("Keys on a nil Proxy must return nil")
+	}
+}
+
+// TestProxyRelaysRedirectUnfollowed: following a redirect inside the relay would
+// let a public URL aim the fetch at an address proxyTarget has already refused.
+func TestProxyRelaysRedirectUnfollowed(t *testing.T) {
+	dest := newUpstream(t, http.StatusOK, "do not fetch me", "text/plain")
+	src := newUpstreamFunc(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Location", dest.server.URL+"/moved")
+		w.WriteHeader(http.StatusFound)
+		_, _ = io.WriteString(w, "redirecting")
+	})
+
+	p := NewProxy([]string{"http://ui.test"}, testLog(t))
+	rec := proxyReq(t, p, http.MethodGet, src.server.URL+"/start", "",
+		map[string]string{"Origin": "http://ui.test"})
+
+	if rec.Code != http.StatusFound {
+		t.Fatalf("status = %d, want the 302 relayed to the caller: %s", rec.Code, rec.Body)
+	}
+	if got := rec.Header().Get("Location"); got != dest.server.URL+"/moved" {
+		t.Errorf("location = %q, want the upstream copy handed back", got)
+	}
+	if rec.Body.String() != "redirecting" {
+		t.Errorf("body = %q, want the 3xx body", rec.Body)
+	}
+	if n := dest.nHits(); n != 0 {
+		t.Errorf("the redirect target was fetched %d times, want 0", n)
+	}
+}
+
+// TestProxyCorsIgnoresOuterWildcard: the relay decides who may read its answers,
+// whatever a layer in front of it wrote on the response.
+func TestProxyCorsIgnoresOuterWildcard(t *testing.T) {
+	u := newUpstream(t, http.StatusOK, "ok", "text/plain")
+	target := "http://" + strings.TrimPrefix(u.server.URL, "http://") + "/mcp"
+	p := NewProxy([]string{"http://ui.test"}, testLog(t))
+
+	outer := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		p.Handle(w, r)
+	})
+
+	for _, tc := range []struct{ origin, want string }{
+		{"http://evil.test", ""},
+		{"http://ui.test", "http://ui.test"},
+	} {
+		r := httptest.NewRequest(http.MethodGet, "/cors-proxy?url="+target, nil)
+		r.Header.Set("Origin", tc.origin)
+		rec := httptest.NewRecorder()
+		outer.ServeHTTP(rec, r)
+		if got := rec.Header().Get("Access-Control-Allow-Origin"); got != tc.want {
+			t.Errorf("origin %s got allow-origin %q, want %q", tc.origin, got, tc.want)
+		}
+	}
+}

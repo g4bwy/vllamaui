@@ -142,15 +142,18 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request) {
 		p = "/"
 	}
 
+	// A wildcard here would let any page the operator visits read the answers of
+	// every route, /tools included. The UI is same-origin and needs no CORS
+	// headers, so the only route that hands any out is the proxy, and it decides
+	// from its own allow list.
 	if r.Method == http.MethodOptions {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Conversation-Id, api-key")
-		w.Header().Set("Access-Control-Allow-Methods", "GET,POST,DELETE,OPTIONS")
+		if p == "/cors-proxy" && s.proxy != nil {
+			s.callProxy(w, r)
+			return
+		}
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
-	// The UI is same-origin, so this is only here for convenience.
-	w.Header().Set("Access-Control-Allow-Origin", "*")
 
 	switch {
 	case p == "/props":

@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -25,12 +26,15 @@ const (
 // Proxy is the CORS relay the browser uses to reach remote MCP servers.
 //
 // It is reached as GET or POST /cors-proxy?url=<target>. Only the origins given
-// to NewProxy get CORS headers back.
+// to NewProxy get CORS headers back, and a key set with Keys has to be presented
+// before any target is fetched at all.
 type Proxy struct {
 	allowed map[string]bool
 	all     bool
 	log     Log
 	client  *http.Client
+	// allow gates the route, set by Keys. nil means no key was configured.
+	allow func(*http.Request) bool
 }
 
 // NewProxy returns nil when allowed is empty: the caller then drops the route
@@ -43,7 +47,16 @@ func NewProxy(allowed []string, logf Log) *Proxy {
 	if logf == nil {
 		logf = func(string, ...any) {}
 	}
-	p := &Proxy{allowed: map[string]bool{}, log: logf, client: &http.Client{}}
+	p := &Proxy{
+		allowed: map[string]bool{},
+		log:     logf,
+		// A 3xx comes back to the caller unfollowed. Following it here would let a
+		// public URL retarget the fetch at an address proxyTarget has just refused,
+		// since the redirect is never checked again.
+		client: &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		}},
+	}
 	for _, o := range allowed {
 		if o == "*" {
 			p.all = true
@@ -51,6 +64,20 @@ func NewProxy(allowed []string, logf Log) *Proxy {
 		}
 		p.allowed[o] = true
 	}
+	return p
+}
+
+// Keys gates Handle: allow reports whether a request may use the relay. It
+// mirrors API.Keys, so the caller reads --api-key in one place and passes the
+// verdict down here. Setting it to nil (or never calling Keys) leaves the route
+// open, like a server with no --api-key.
+//
+// Set it before the server starts: it is read without a lock.
+func (p *Proxy) Keys(allow func(*http.Request) bool) *Proxy {
+	if p == nil {
+		return nil
+	}
+	p.allow = allow
 	return p
 }
 
@@ -62,11 +89,25 @@ func (p *Proxy) Handle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Before any target work: an unauthenticated caller must not be able to use
+	// this host as a relay at all, whatever the url says.
+	if p.allow != nil && !p.allow(r) {
+		p.fail(w, r, http.StatusUnauthorized, kindAuthentication, "Invalid API Key")
+		return
+	}
+
 	p.cors(w, r)
 
 	switch r.Method {
 	case http.MethodGet, http.MethodPost:
 	case http.MethodOptions:
+		// A preflight from a page outside the allow list is answered with nothing
+		// to work with: the browser stops without an allow-origin, so the rest of
+		// the headers are not handed out either.
+		if origin := r.Header.Get("Origin"); origin != "" && !p.permits(origin) {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
 		// A cross-origin POST with a Content-Type header needs a preflight.
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 		if req := r.Header.Get("Access-Control-Request-Headers"); req != "" {
@@ -166,6 +207,9 @@ func proxyTarget(raw string) (*url.URL, error) {
 	if _, hasPassword := u.User.Password(); hasPassword {
 		return nil, fmt.Errorf("authentication in target URL is not supported")
 	}
+	if why := refusedTargetHost(u.Hostname()); why != "" {
+		return nil, fmt.Errorf("target address is not allowed: %s", why)
+	}
 	// llama-server keeps only the scheme, host, port and path: a username here
 	// would otherwise turn into a Basic header that no caller asked for.
 	u.User = nil
@@ -173,6 +217,36 @@ func proxyTarget(raw string) (*url.URL, error) {
 		u.Path = "/"
 	}
 	return u, nil
+}
+
+// awsIPv6Metadata is how AWS reaches the instance metadata service over IPv6.
+// It sits inside fc00::/7, so no standard predicate flags it.
+var awsIPv6Metadata = net.ParseIP("fd00:ec2::254")
+
+// refusedTargetHost says why a target host must not be fetched, or "" when it
+// may. It covers the link-local ranges and the cloud metadata endpoints, which
+// hand back credentials for the machine this server runs on.
+//
+// Loopback stays allowed: a local MCP server is the main thing the relay is for,
+// and reaching this port is already bounded by the loopback listen default and
+// by the api key gate.
+func refusedTargetHost(host string) string {
+	lower := strings.TrimSuffix(strings.ToLower(host), ".")
+	if lower == "metadata.google.internal" {
+		return lower + " is a cloud metadata host name"
+	}
+	// A bracketed IPv6 literal arrives as [::1] in a URL, and Hostname() has
+	// already dropped the brackets; this also catches a host typed with them.
+	ip := net.ParseIP(strings.TrimSuffix(strings.TrimPrefix(lower, "["), "]"))
+	switch {
+	case ip == nil:
+		return "" // a name is what the caller means to reach, and is not checked
+	case ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast():
+		return lower + " is a link-local address" // 169.254.0.0/16, fe80::/10
+	case ip.Equal(awsIPv6Metadata):
+		return lower + " is the AWS IPv6 metadata address"
+	}
+	return ""
 }
 
 // forwardHeaders copies the prefixed headers, renamed. Nothing else of the
@@ -230,9 +304,17 @@ func copyProxyHeaders(dst, src http.Header) {
 	}
 }
 
+// permits reports whether an origin may read what the relay brings back.
+func (p *Proxy) permits(origin string) bool {
+	return p.all || p.allowed[origin]
+}
+
 // cors echoes the caller's Origin when it is allowed. A "*" list allows any
 // origin, and an origin is echoed for it too so a credentialed fetch still works.
 func (p *Proxy) cors(w http.ResponseWriter, r *http.Request) {
+	// Whatever an outer layer wrote is dropped first, so a disallowed origin
+	// provably gets no allow-origin back rather than a wildcard left behind.
+	w.Header().Del("Access-Control-Allow-Origin")
 	origin := r.Header.Get("Origin")
 	if origin == "" {
 		if p.all {
@@ -240,7 +322,7 @@ func (p *Proxy) cors(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	if p.all || p.allowed[origin] {
+	if p.permits(origin) {
 		w.Header().Set("Access-Control-Allow-Origin", origin)
 	}
 }

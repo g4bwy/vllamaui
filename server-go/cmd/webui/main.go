@@ -6,9 +6,11 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -52,7 +54,8 @@ func main() {
 
 	// Tools and MCP servers, both opt-in the way llama-server has them. A
 	// shell tool reachable from a browser is not something to enable by
-	// accident, so an empty --tools list leaves /tools answering 403.
+	// accident, so an empty --tools list leaves /tools answering 403, and a
+	// write-capable one refuses to start unless a key guards it (toolsGuard).
 	tooling := buildTools(ctx, cfg, log)
 	s.Attach(tooling.api, tooling.proxy)
 	defer tooling.shutdown()
@@ -158,7 +161,17 @@ func buildTools(ctx context.Context, cfg *appconf.Config, log backend.Log) tooli
 	}
 
 	if len(regs) > 0 {
-		api := toolsapi.New(toolsapi.Merge(regs...), toolsapi.Log(log))
+		merged := toolsapi.Merge(regs...)
+		warn, err := toolsGuard(cfg, merged.List())
+		if err != nil {
+			log("%s", err)
+			os.Exit(1)
+		}
+		if warn != "" {
+			out.notes = append(out.notes, warn)
+		}
+
+		api := toolsapi.New(merged, toolsapi.Log(log))
 		if cfg.InboundKey != "" {
 			api.Keys(authorized(cfg.InboundKey))
 			out.notes = append(out.notes, "  /tools    guarded by an api key")
@@ -171,10 +184,48 @@ func buildTools(ctx context.Context, cfg *appconf.Config, log backend.Log) tooli
 		if len(origins) == 0 {
 			origins = defaultOrigins(cfg)
 		}
-		out.proxy = toolsapi.NewProxy(origins, toolsapi.Log(log))
-		out.notes = append(out.notes, "  proxy     /cors-proxy for "+strings.Join(origins, " "))
+		proxy := toolsapi.NewProxy(origins, toolsapi.Log(log))
+		note := "  proxy     /cors-proxy for " + strings.Join(origins, " ")
+		if cfg.InboundKey != "" {
+			// The relay fetches whatever url the caller names, so it is guarded by
+			// the same key /tools is.
+			proxy.Keys(authorized(cfg.InboundKey))
+			note += ", guarded by an api key"
+		}
+		out.proxy = proxy
+		out.notes = append(out.notes, note)
 	}
 	return out
+}
+
+// toolsGuard checks the tools that are about to be served against the key that
+// guards them. A tool flagged write=true can change this machine, and an empty
+// InboundKey means the port answers anyone who can reach it. It returns the
+// error that stops startup, or the warning line to print when the operator opted
+// out with --allow-unauthenticated-tools.
+//
+// The write flag is read from the tool contracts, so a MCP server that advertises
+// a write tool is covered the same way as the built-in shell.
+func toolsGuard(cfg *appconf.Config, listed []contracts.ToolInfo) (warn string, err error) {
+	if cfg.InboundKey != "" {
+		return "", nil
+	}
+	var powerful []string
+	for _, t := range listed {
+		if t.Permissions.Write {
+			powerful = append(powerful, t.Tool)
+		}
+	}
+	if len(powerful) == 0 {
+		return "", nil
+	}
+	joined := strings.Join(powerful, ", ")
+	if cfg.AllowUnauthenticatedTools {
+		return "  WARNING   " + joined + " can change this machine and /tools has no api key: " +
+			"anyone who can reach " + net.JoinHostPort(cfg.Host, strconv.Itoa(cfg.Port)) + " may call them", nil
+	}
+	return "", fmt.Errorf("refusing to start: the tools %s can change this machine, and /tools has no api key to guard it. "+
+		"Pass --require-api-key <key>, or --allow-unauthenticated-tools to start anyway.", joined)
 }
 
 // names joins the tool names a registry reports.
@@ -271,8 +322,14 @@ func authorized(key string) func(*http.Request) bool {
 // operator opens next to the server, not about the server itself.
 func defaultOrigins(cfg *appconf.Config) []string {
 	host := cfg.Host
-	if host == "0.0.0.0" || host == "" {
+	if host == "" || host == "0.0.0.0" || host == "::" {
 		host = "localhost"
 	}
-	return []string{fmt.Sprintf("http://%s:%d", host, cfg.Port), fmt.Sprintf("http://127.0.0.1:%d", cfg.Port)}
+	origins := []string{fmt.Sprintf("http://%s:%d", host, cfg.Port)}
+	// The page is usually opened as 127.0.0.1 whatever the bind address, so both
+	// spellings of loopback are allowed.
+	if host != "127.0.0.1" {
+		origins = append(origins, fmt.Sprintf("http://127.0.0.1:%d", cfg.Port))
+	}
+	return origins
 }

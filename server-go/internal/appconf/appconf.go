@@ -31,7 +31,7 @@ type Config struct {
 	KeepUnsupported bool
 	ProbeVision     bool
 	ProbeThinking   bool
-	Host            string
+	Host            string // listen address; loopback by default, see load
 	Port            int
 	Dist            string
 
@@ -53,6 +53,10 @@ type Config struct {
 	// InboundKey guards /tools and /cors-proxy. Distinct from APIKey, which is
 	// what this server sends upstream.
 	InboundKey string
+	// AllowUnauthenticatedTools starts the server anyway when a tool that can
+	// change this machine is enabled without an InboundKey. The default is to
+	// stop, because such a tool answers any process that can reach the port.
+	AllowUnauthenticatedTools bool
 	// UsingDotEnv says a .env was read, which the boot log reports.
 	UsingDotEnv bool
 }
@@ -209,7 +213,9 @@ func load(args []string, binDir string) (*Config, error) {
 	cfg.KeepUnsupported = env("VLLM_KEEP_UNSUPPORTED") == "1"
 	cfg.ProbeVision = env("VLLM_PROBE_VISION") != "0"
 	cfg.ProbeThinking = env("VLLM_PROBE_THINKING") != "0"
-	cfg.Host = firstOf(env("HOST"), "0.0.0.0")
+	// Loopback, not 0.0.0.0: the port serves the UI and, with --tools, the shell
+	// and file tools. A LAN broadcast has to be something the operator asks for.
+	cfg.Host = firstOf(env("HOST"), "127.0.0.1")
 	cfg.Port = intOf(env("PORT"), 8080)
 	cfg.Dist = firstOf(env("UI_DIST"), filepath.Join(root, "dist"))
 	cfg.Tools = parseToolList(firstOf(env("TOOLS"), env("LLAMA_TOOLS")))
@@ -218,6 +224,7 @@ func load(args []string, binDir string) (*Config, error) {
 	cfg.MCPServersJSON = firstOf(env("MCP_SERVERS_JSON"), env("LLAMA_MCP_SERVERS_JSON"))
 	cfg.UIMCPPROXY = oneOf(env("UI_MCP_PROXY"), env("WEBUI_MCP_PROXY"))
 	cfg.InboundKey = firstOf(env("API_KEY"), env("WEBUI_API_KEY"))
+	cfg.AllowUnauthenticatedTools = oneOf(env("ALLOW_UNAUTHENTICATED_TOOLS"))
 	cfg.CORSOrigins = splitList(firstOf(env("CORS_ORIGINS"), env("LLAMA_CORS_ORIGINS")))
 
 	fs := flag.NewFlagSet("webui", flag.ContinueOnError)
@@ -233,7 +240,7 @@ func load(args []string, binDir string) (*Config, error) {
 	fs.StringVar(&keep, "keep-unsupported", boolToFlag(cfg.KeepUnsupported), "send params the backend rejects")
 	fs.BoolVar(&cfg.ProbeThinking, "probe-thinking", cfg.ProbeThinking, "ask at startup whether the model thinks")
 	fs.BoolVar(&cfg.ProbeVision, "probe-vision", cfg.ProbeVision, "ask at startup whether the model sees")
-	fs.StringVar(&cfg.Host, "host", cfg.Host, "listen address")
+	fs.StringVar(&cfg.Host, "host", cfg.Host, "listen address (default 127.0.0.1, loopback only, so the port is not reachable from the LAN)")
 	fs.IntVar(&cfg.Port, "port", cfg.Port, "listen port")
 	fs.StringVar(&cfg.Dist, "dist", cfg.Dist, "built UI to serve")
 	tools := fs.String("tools", strings.Join(cfg.Tools, ","), "server tools: comma list, or all")
@@ -241,7 +248,8 @@ func load(args []string, binDir string) (*Config, error) {
 	fs.StringVar(&cfg.MCPServersConfig, "mcp-servers-config", cfg.MCPServersConfig, "path to an mcpServers JSON file")
 	fs.StringVar(&cfg.MCPServersJSON, "mcp-servers-json", cfg.MCPServersJSON, "inline mcpServers JSON")
 	fs.BoolVar(&cfg.UIMCPPROXY, "ui-mcp-proxy", cfg.UIMCPPROXY, "serve /cors-proxy for browser MCP servers")
-	fs.StringVar(&cfg.InboundKey, "require-api-key", cfg.InboundKey, "key callers must present for /tools")
+	fs.StringVar(&cfg.InboundKey, "require-api-key", cfg.InboundKey, "key callers must present for /tools and /cors-proxy")
+	fs.BoolVar(&cfg.AllowUnauthenticatedTools, "allow-unauthenticated-tools", cfg.AllowUnauthenticatedTools, "start even when a write or exec tool has no --require-api-key")
 	cors := fs.String("cors-origins", strings.Join(cfg.CORSOrigins, ","), "origins allowed on /cors-proxy")
 	if err := fs.Parse(args); err != nil {
 		return nil, err

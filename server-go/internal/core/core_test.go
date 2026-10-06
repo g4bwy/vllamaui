@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -15,6 +16,7 @@ import (
 
 	"llama-webui/server/internal/appconf"
 	"llama-webui/server/internal/backend"
+	"llama-webui/server/internal/toolsapi"
 )
 
 // fakeEngine is the inference server these tests talk to. It answers a fixed
@@ -439,27 +441,108 @@ func bodyText(b map[string]any) string {
 	return string(out)
 }
 
+// corsResponseHeaders are the headers a cross-origin answer would carry. The
+// router is expected to write none of them.
+var corsResponseHeaders = []string{
+	"Access-Control-Allow-Origin",
+	"Access-Control-Allow-Headers",
+	"Access-Control-Allow-Methods",
+	"Access-Control-Allow-Credentials",
+}
+
 func TestOptionsPreflight(t *testing.T) {
 	h := newHarness(t, "vllm", vllmEngine(), nil)
 	rec := h.do(http.MethodOptions, "/v1/chat/completions")
 	if rec.Code != http.StatusNoContent {
 		t.Fatalf("status = %d", rec.Code)
 	}
-	if got := rec.Header().Get("Access-Control-Allow-Origin"); got != "*" {
-		t.Errorf("allow-origin = %q", got)
-	}
-	for _, want := range []string{"Content-Type", "Authorization", "X-Conversation-Id", "api-key"} {
-		if !strings.Contains(rec.Header().Get("Access-Control-Allow-Headers"), want) {
-			t.Errorf("allow-headers must list %s: %q", want, rec.Header().Get("Access-Control-Allow-Headers"))
+	// Nothing was attached to this server, so no route may answer a preflight
+	// with a wildcard: that is what let any page read /tools.
+	for _, name := range corsResponseHeaders {
+		if got := rec.Header().Get(name); got != "" {
+			t.Errorf("OPTIONS %s = %q, want the header absent", name, got)
 		}
 	}
-	if got := rec.Header().Get("Access-Control-Allow-Methods"); !strings.Contains(got, "DELETE") {
-		t.Errorf("allow-methods = %q", got)
+	// The UI is same-origin, so the API answers carry no CORS header at all.
+	props := h.get("/props")
+	if got := props.Header().Get("Access-Control-Allow-Origin"); got != "" {
+		t.Errorf("props allow-origin = %q, want the header absent", got)
 	}
-	// The UI is same-origin, so this header is only there for convenience; every
-	// other answer carries it too.
-	if got := h.get("/props").Header().Get("Access-Control-Allow-Origin"); got != "*" {
-		t.Errorf("props allow-origin = %q", got)
+}
+
+// TestCorsProxyPreflight: the relay is the one route with an origin allow list,
+// so the router hands a preflight for it to the proxy, and the proxy decides.
+func TestCorsProxyPreflight(t *testing.T) {
+	h := newHarness(t, "vllm", vllmEngine(), nil)
+	h.s.Attach(nil, toolsapi.NewProxy([]string{"http://ui.test"}, nil))
+
+	options := func(origin string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodOptions, "/cors-proxy?url=http://127.0.0.1:1/mcp", nil)
+		req.Header.Set("Origin", origin)
+		req.Header.Set("Access-Control-Request-Method", "POST")
+		rec := httptest.NewRecorder()
+		h.s.Handler().ServeHTTP(rec, req)
+		return rec
+	}
+
+	rec := options("http://ui.test")
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("status = %d body %s", rec.Code, rec.Body)
+	}
+	if got := rec.Header().Get("Access-Control-Allow-Origin"); got != "http://ui.test" {
+		t.Errorf("allow-origin = %q, want the allowed origin echoed", got)
+	}
+	if got := rec.Header().Get("Access-Control-Allow-Methods"); !strings.Contains(got, "POST") {
+		t.Errorf("allow-methods = %q, want POST listed", got)
+	}
+
+	// A page outside the allow list gets a preflight that says nothing, so the
+	// browser stops before the real request.
+	rec = options("http://evil.test")
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	for _, name := range corsResponseHeaders {
+		if got := rec.Header().Get(name); got != "" {
+			t.Errorf("a foreign origin got %s = %q, want the header absent", name, got)
+		}
+	}
+}
+
+// TestCorsProxyResponseCarriesNoWildcardForForeignOrigin is the end-to-end form
+// of the same rule: the upstream answer, the relay body and everything else stay
+// readable only by an origin on the list.
+func TestCorsProxyResponseCarriesNoWildcardForForeignOrigin(t *testing.T) {
+	mcp := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"jsonrpc":"2.0","result":{}}`)
+	}))
+	defer mcp.Close()
+
+	h := newHarness(t, "vllm", vllmEngine(), nil)
+	h.s.Attach(nil, toolsapi.NewProxy([]string{"http://ui.test"}, nil))
+
+	req := httptest.NewRequest(http.MethodGet, "/cors-proxy?url="+mcp.URL+"/mcp", nil)
+	req.Header.Set("Origin", "http://evil.test")
+	rec := httptest.NewRecorder()
+	h.s.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body %s", rec.Code, rec.Body)
+	}
+	for _, name := range corsResponseHeaders {
+		if got := rec.Header().Get(name); got != "" {
+			t.Errorf("%s = %q, want the header absent for a foreign origin", name, got)
+		}
+	}
+
+	// The allowed origin still reads the answer.
+	req.Header.Set("Origin", "http://ui.test")
+	rec = httptest.NewRecorder()
+	h.s.Handler().ServeHTTP(rec, req)
+	if got := rec.Header().Get("Access-Control-Allow-Origin"); got != "http://ui.test" {
+		t.Errorf("allow-origin = %q, want the allowed origin echoed", got)
 	}
 }
 

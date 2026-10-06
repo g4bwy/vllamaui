@@ -34,6 +34,8 @@ func clearEnv(t *testing.T) {
 		"UPSTREAM_API_KEY", "VLLM_API_KEY", "OPENAI_API_KEY", "VLLM_MODEL",
 		"VLLM_N_CTX", "VLLM_MODALITY_VISION", "VLLM_ENGINE_TIMINGS",
 		"VLLM_KEEP_UNSUPPORTED", "VLLM_PROBE_VISION", "VLLM_PROBE_THINKING",
+		"ALLOW_UNAUTHENTICATED_TOOLS", "API_KEY", "WEBUI_API_KEY", "TOOLS", "LLAMA_TOOLS",
+		"UI_MCP_PROXY", "WEBUI_MCP_PROXY", "CORS_ORIGINS", "LLAMA_CORS_ORIGINS",
 	} {
 		t.Setenv(k, "")
 		os.Unsetenv(k)
@@ -47,8 +49,16 @@ func TestDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Backend != "auto" || cfg.Port != 8080 || cfg.Host != "0.0.0.0" {
-		t.Errorf("cfg = %+v", cfg)
+	// Loopback is the whole point of the default: a plain start must not answer
+	// to the network.
+	if cfg.Backend != "auto" || cfg.Port != 8080 || cfg.Host != "127.0.0.1" {
+		t.Errorf("cfg = %+v, want auto on port 8080 bound to loopback", cfg)
+	}
+	if cfg.InboundKey != "" {
+		t.Errorf("api key = %q, want none", cfg.InboundKey)
+	}
+	if cfg.AllowUnauthenticatedTools {
+		t.Error("a write-capable tool without a key must stop the server by default")
 	}
 	if cfg.Upstream != "http://localhost:8000" {
 		t.Errorf("upstream = %q", cfg.Upstream)
@@ -196,5 +206,64 @@ func TestUpstreamHost(t *testing.T) {
 	c := &Config{Upstream: "http://vllm.internal:8000/v1"}
 	if got := c.UpstreamHost(); got != "vllm.internal:8000" {
 		t.Errorf("host = %q", got)
+	}
+}
+
+// TestHostOverride: an operator who does want the LAN still can, from either
+// source that sets the rest of the configuration.
+func TestHostOverride(t *testing.T) {
+	clearEnv(t)
+	_, bin := project(t, "")
+	t.Setenv("HOST", "0.0.0.0")
+	cfg, err := load(nil, bin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Host != "0.0.0.0" {
+		t.Errorf("HOST must still be honoured, got %q", cfg.Host)
+	}
+
+	cfg, err = load([]string{"-host", "10.0.0.5"}, bin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Host != "10.0.0.5" {
+		t.Errorf("-host = %q, want the flag to win", cfg.Host)
+	}
+}
+
+// TestAllowUnauthenticatedTools: the opt-out is read the way the other switches
+// are, from the environment and from the flag.
+func TestAllowUnauthenticatedTools(t *testing.T) {
+	clearEnv(t)
+	_, bin := project(t, "")
+	for _, v := range []string{"1", "true", "TRUE"} {
+		t.Setenv("ALLOW_UNAUTHENTICATED_TOOLS", v)
+		cfg, err := load(nil, bin)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !cfg.AllowUnauthenticatedTools {
+			t.Errorf("ALLOW_UNAUTHENTICATED_TOOLS=%s must opt out of the guard", v)
+		}
+	}
+	for _, v := range []string{"", "0", "no"} {
+		t.Setenv("ALLOW_UNAUTHENTICATED_TOOLS", v)
+		cfg, err := load(nil, bin)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.AllowUnauthenticatedTools {
+			t.Errorf("ALLOW_UNAUTHENTICATED_TOOLS=%q must keep the guard on", v)
+		}
+	}
+
+	t.Setenv("ALLOW_UNAUTHENTICATED_TOOLS", "1")
+	cfg, err := load([]string{"-allow-unauthenticated-tools=false"}, bin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.AllowUnauthenticatedTools {
+		t.Error("the flag must be able to turn the opt-out back off")
 	}
 }
