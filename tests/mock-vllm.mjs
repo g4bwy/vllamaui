@@ -15,6 +15,8 @@ import http from 'node:http';
 const port = Number(process.argv[2] || 8011);
 let tokens = 0;
 
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
 // Cumulative counters that advance with every request, the way a real engine's
 // do. Frozen counters hide bugs in a proxy that diffs two scrapes, and hid one.
 const counters = {
@@ -32,17 +34,20 @@ const counters = {
 	accepted: 0
 };
 
+// the prompt speed the mock claims, in tokens per second
+const PREFILL_TPS = 1400;
+
 const seenPrompts = new Map();
 
 function recordRequest(prompt, computed, cached, gen) {
 	counters.requests += 1;
-	counters.prefill_s += computed / 1400; // about 1400 tokens/s reading the prompt
+	counters.prefill_s += computed / PREFILL_TPS; // about 1400 tokens/s reading the prompt
 	counters.decode_s += gen / 40; // about 40 tokens/s writing the answer
 	counters.computed += computed;
 	counters.prefixQueries += prompt;
 	counters.prefixHits += cached;
 	counters.promptTokens += prompt;
-	counters.ttft_s += computed / 1400;
+	counters.ttft_s += computed / PREFILL_TPS;
 	counters.itl_s += gen > 1 ? gen / 40 : 0;
 	counters.drafts += 1;
 	counters.draftTokens += Math.round(gen * 1.6);
@@ -128,6 +133,12 @@ const server = http.createServer(async (req, res) => {
 	const cached = seenPrompts.has(key) ? Math.round(prompt * 0.9) : 0;
 	seenPrompts.set(key, prompt);
 
+	// No token may arrive before the prefill the counters claim took. A proxy
+	// that diffs those counters against its own clock is right to refuse a window
+	// where the engine reports more prefill time than the request ever waited, so
+	// the mock has to wait like the speed it advertises.
+	await sleep(Math.max(20, ((prompt - cached) / PREFILL_TPS) * 1000));
+
 	// "tool_batch": true replays the frame order that broke the webui: vLLM
 	// numbers the calls globally, and a stray newline splits them into two
 	// batches. See server/adapter.mjs, renumberDeltaToolCalls.
@@ -161,7 +172,7 @@ const server = http.createServer(async (req, res) => {
 		const truncate = parsed.truncate === true;
 		const count = truncate ? 3 : WORDS.length;
 		for (let i = 0; i < count; i++) {
-			await new Promise((r) => setTimeout(r, 60));
+			await sleep(60);
 			res.write(`data: ${JSON.stringify({ id: 'mock-1', model: parsed.model, choices: [{ index: 0, delta: { content: ' ' + WORDS[i % WORDS.length] }, token_ids: [i + 10] }] })}\n\n`);
 		}
 		if (truncate) {

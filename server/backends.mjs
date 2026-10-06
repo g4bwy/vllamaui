@@ -121,32 +121,63 @@ function commonTranslate(out, drop, dropped) {
 	return out;
 }
 
-// A wall-clock timings object from what the stream itself told us. Used by
-// every backend when the engine reported nothing of its own.
-function wallTimings(st, usage, tSend) {
+// Counts from what the stream itself told us, and no prompt rate: the window
+// from send to first token holds queue wait and network as well as the prefill,
+// and usage.prompt_tokens counts tokens the engine reused rather than computed.
+// The decode rate stays, since those tokens were watched one by one, and so do
+// the counts, because the UI adds prompt_n + cache_n + predicted_n for the
+// context gauge. Used by every backend when the engine said nothing of its own.
+function wallTimings(st, usage) {
 	const promptTotal = usage?.prompt_tokens ?? 0;
 	const cached = usage?.prompt_tokens_details?.cached_tokens ?? 0;
-	const predicted_n = usage?.completion_tokens ?? st.tokens;
-	const timings = {
-		predicted_n,
-		predicted_ms: round1(st.firstAt && st.lastAt ? Math.max(st.lastAt - st.firstAt, 1) : 0)
+	return {
+		predicted_n: usage?.completion_tokens ?? st.tokens,
+		predicted_ms: round1(st.firstAt && st.lastAt ? Math.max(st.lastAt - st.firstAt, 1) : 0),
+		prompt_n: Math.max(promptTotal - cached, 0),
+		cache_n: cached
 	};
-	const prompt_n = Math.max(promptTotal - cached, 0);
-	if (cached > 0) timings.cache_n = cached;
-	if (prompt_n > 0 && st.firstAt) {
-		timings.prompt_n = prompt_n;
-		timings.prompt_ms = round1(Math.max(st.firstAt - tSend, 1));
-	}
-	return timings;
+}
+
+// tokens per second, or a dash when no measured window backs the number up
+function rate(n, ms) {
+	return ms ? `${((n / ms) * 1000).toFixed(1)} t/s` : '- t/s';
 }
 
 function logSpeed(source, timings) {
-	const pp = timings.prompt_ms ? ((timings.prompt_n || 0) / timings.prompt_ms) * 1000 : 0;
-	const tg = timings.predicted_ms ? (timings.predicted_n / timings.predicted_ms) * 1000 : 0;
-	return `timings(${source}) pp ${timings.prompt_n || 0} tok ${pp.toFixed(1)} t/s | tg ${timings.predicted_n} tok ${tg.toFixed(1)} t/s | cache ${timings.cache_n || 0}`;
+	const prompt_n = timings.prompt_n || 0;
+	const predicted_n = timings.predicted_n || 0;
+	return `timings(${source}) pp ${prompt_n} tok ${rate(prompt_n, timings.prompt_ms)} | tg ${predicted_n} tok ${rate(predicted_n, timings.predicted_ms)} | cache ${timings.cache_n || 0}`;
 }
 
 // ---------------------------------------------------------------- vLLM
+
+// Decide whether the histogram diff between two scrapes can only be our own
+// request. This replaces an idle-server condition (nothing running and nothing
+// waiting when the window opened) that measurement showed never holds: a shared
+// box runs three or four requests all day, so the diff is now attributed to our
+// request among the concurrent ones by what the engine cannot have done:
+//   - exactly one prefill and one decode finished in the window, and no counter
+//     moved backwards, which is what an engine restart mid-request looks like;
+//   - the computed tokens fit inside our own prompt, so a foreign request longer
+//     than that cannot be mistaken for us;
+//   - the prefill took no more time than the wall clock until our first token,
+//     and that token came within 3x the prefill plus 250 ms of slack, which
+//     covers network and the scrape gap. Without the bound a window where
+//     queueing dominated would have its wait reported as prefill speed.
+// promptTotal is usage.prompt_tokens, ttftMs our own measured first token.
+function attribute(pre, post, promptTotal, ttftMs) {
+	if (!pre || !post) return null;
+	const d = (k) => (post[k] || 0) - (pre[k] || 0);
+	if (d('prefillCount') !== 1 || d('decodeCount') !== 1) return null;
+	for (const k of ['prefillSum', 'decodeSum', 'computedCount', 'computedSum']) {
+		if (d(k) < 0) return null;
+	}
+	const prompt_n = Math.round(d('computedSum'));
+	if (prompt_n < 1 || prompt_n > promptTotal) return null;
+	const prompt_ms = round1(d('prefillSum') * 1000);
+	if (prompt_ms > ttftMs || ttftMs > prompt_ms * 3 + 250) return null;
+	return { prompt_n, prompt_ms, predicted_ms: round1(d('decodeSum') * 1000) };
+}
 
 // vLLM describes its KV layout in one labelled Prometheus line, not JSON
 export function parseCacheConfig(text) {
@@ -225,21 +256,18 @@ export function vllmBackend(ctx) {
 			else if (hasText) st.tokens += 1;
 		},
 
-		// histogram deltas, but only when this request was alone in the window
+		// histogram deltas, when they can only be this request's
 		finalTimings(st, pre, post, tSend) {
-			const timings = wallTimings(st, st.usage, tSend);
+			const timings = wallTimings(st, st.usage);
 			let source = 'wall';
-			const dCount = pre && post ? post.prefillCount - pre.prefillCount : 0;
-			const quiet = pre && (pre.running || 0) === 0 && (pre.waiting || 0) === 0;
-			const rising = post && pre && post.prefillSum >= pre.prefillSum && post.decodeSum >= pre.decodeSum && post.computedSum >= pre.computedSum;
-			if (dCount === 1 && quiet && rising) {
+			const promptTotal = st.usage?.prompt_tokens ?? 0;
+			const a = attribute(pre, post, promptTotal, st.firstAt - tSend);
+			if (a) {
 				source = 'engine';
-				const promptTotal = st.usage?.prompt_tokens ?? 0;
-				const prompt_n = Math.max(Math.round(post.computedSum - pre.computedSum), 0);
-				timings.prompt_ms = round1((post.prefillSum - pre.prefillSum) * 1000);
-				timings.predicted_ms = round1((post.decodeSum - pre.decodeSum) * 1000) || timings.predicted_ms;
-				timings.prompt_n = prompt_n;
-				timings.cache_n = Math.max(promptTotal - prompt_n, 0);
+				timings.prompt_n = a.prompt_n;
+				timings.cache_n = Math.max(promptTotal - a.prompt_n, 0);
+				timings.prompt_ms = a.prompt_ms;
+				if (a.predicted_ms) timings.predicted_ms = a.predicted_ms;
 			}
 			ctx.log(logSpeed(source, timings));
 			return { timings, source };
@@ -385,7 +413,7 @@ export function strataBackend(ctx) {
 			let source = 'engine';
 			let timings = fromEngine;
 			if (!timings) {
-				timings = wallTimings(st, st.usage, tSend);
+				timings = wallTimings(st, st.usage);
 				source = 'wall';
 			}
 			ctx.log(logSpeed(source, timings));

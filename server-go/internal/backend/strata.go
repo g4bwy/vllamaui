@@ -193,7 +193,7 @@ func (s *strata) FinalTimings(st *Stream, pre, post *Snapshot, tSend time.Time) 
 	timings := st.Inband
 	source := "engine"
 	if timings == nil {
-		timings = WallTimings(st, tSend)
+		timings = WallTimings(st)
 		source = "wall"
 	}
 	s.d.Log(SpeedLine(source, timings))

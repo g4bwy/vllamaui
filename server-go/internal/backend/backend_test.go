@@ -3,6 +3,7 @@ package backend
 import (
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -253,6 +254,292 @@ func TestSpeedLineFormat(t *testing.T) {
 	if line != "timings(engine) pp 63 tok 742.0 t/s | tg 900 tok 98.1 t/s | cache 0" {
 		t.Errorf("unexpected log line: %s", line)
 	}
+	// Counts with no measured window behind them get no rate.
+	line = SpeedLine("wall", map[string]any{
+		"prompt_n": 338.0, "predicted_n": 38.0, "predicted_ms": 550.0, "cache_n": 0.0,
+	})
+	if line != "timings(wall) pp 338 tok - t/s | tg 38 tok 69.1 t/s | cache 0" {
+		t.Errorf("unexpected log line: %s", line)
+	}
+}
+
+// ---------- attribution of the vLLM histogram window ----------
+
+// hist is one scrape of the counters the attribution test reads, plus the two
+// gauges a shared server always carries.
+type hist struct {
+	prefillCount  float64
+	decodeCount   float64
+	computedCount float64
+	prefillSum    float64
+	decodeSum     float64
+	computedSum   float64
+	running       float64
+	waiting       float64
+}
+
+func (h hist) snapshot() *Snapshot {
+	return &Snapshot{P: map[string]float64{
+		"prefillCount":  h.prefillCount,
+		"decodeCount":   h.decodeCount,
+		"computedCount": h.computedCount,
+		"prefillSum":    h.prefillSum,
+		"decodeSum":     h.decodeSum,
+		"computedSum":   h.computedSum,
+		"running":       h.running,
+		"waiting":       h.waiting,
+	}}
+}
+
+// measuredPre is the opening scrape of the window, taken on a box that serves
+// three requests at a time with four more waiting. Nothing about it is idle.
+var measuredPre = hist{
+	prefillCount: 1000, decodeCount: 1000, computedCount: 1000,
+	prefillSum: 200, decodeSum: 400, computedSum: 300000,
+	running: 3, waiting: 4,
+}
+
+// after is the closing scrape, given what moved during the window: the three
+// request counts, the prefill and decode time in milliseconds, and the tokens
+// the engine computed rather than reused.
+func after(dPrefill, dDecode, dComputed, prefillMS, decodeMS, computed float64) hist {
+	return hist{
+		prefillCount:  measuredPre.prefillCount + dPrefill,
+		decodeCount:   measuredPre.decodeCount + dDecode,
+		computedCount: measuredPre.computedCount + dComputed,
+		prefillSum:    measuredPre.prefillSum + prefillMS/1000,
+		decodeSum:     measuredPre.decodeSum + decodeMS/1000,
+		computedSum:   measuredPre.computedSum + computed,
+		running:       measuredPre.running,
+		waiting:       measuredPre.waiting,
+	}
+}
+
+// measuredStream is our own request as the stream reported it: a prompt of
+// total tokens, 38 tokens of output, the first token ttftMS after the send, and
+// the last one 550 ms after that. vLLM answers prompt_tokens_details as null on
+// this build, so the usage chunk says nothing about reuse.
+func measuredStream(total float64, ttftMS int64) (*Stream, time.Time) {
+	tSend := time.Unix(1737000000, 0)
+	return &Stream{
+		FirstAt: tSend.Add(time.Duration(ttftMS) * time.Millisecond),
+		LastAt:  tSend.Add(time.Duration(ttftMS+550) * time.Millisecond),
+		Tokens:  38,
+		Usage:   jsonMap(fmt.Sprintf(`{"prompt_tokens":%d,"completion_tokens":38}`, int(total))),
+	}, tSend
+}
+
+func TestVLLMFinalTimingsAttribution(t *testing.T) {
+	cases := []struct {
+		name     string
+		post     hist
+		total    float64
+		ttft     int64
+		attribut bool
+		wantVals map[string]float64
+		wantLog  string
+	}{
+		{
+			// The engine truth for this request was 336 computed tokens in
+			// 198 ms of prefill. Dividing the same tokens by the 229 ms of
+			// wall time instead gives 1467.2, the wrong number this replaced.
+			name:     "one finished request on a busy server",
+			post:     after(1, 1, 1, 198, 400, 336),
+			total:    338,
+			ttft:     229,
+			attribut: true,
+			wantVals: map[string]float64{"prompt_n": 336, "prompt_ms": 198, "cache_n": 2, "predicted_n": 38, "predicted_ms": 400},
+			wantLog:  "timings(engine) pp 336 tok 1697.0 t/s | tg 38 tok 95.0 t/s | cache 2",
+		},
+		{
+			// A warm prefix: 363 of the 383 tokens were reused, so only 20
+			// count as work, in 15 ms.
+			name:     "warm prefix, most of the prompt reused",
+			post:     after(1, 1, 1, 15, 400, 20),
+			total:    383,
+			ttft:     240,
+			attribut: true,
+			wantVals: map[string]float64{"prompt_n": 20, "prompt_ms": 15, "cache_n": 363, "predicted_ms": 400},
+			wantLog:  "timings(engine) pp 20 tok 1333.3 t/s | tg 38 tok 95.0 t/s | cache 363",
+		},
+		{
+			// A foreign request finished: it cannot have taken three seconds
+			// of prefill when our first token arrived after 229 ms.
+			name:     "prefill longer than the wait for the first token",
+			post:     after(1, 1, 1, 3000, 400, 336),
+			total:    338,
+			ttft:     229,
+			wantVals: map[string]float64{"prompt_n": 338, "cache_n": 0, "predicted_ms": 550},
+			wantLog:  "timings(wall) pp 338 tok - t/s | tg 38 tok 69.1 t/s | cache 0",
+		},
+		{
+			// Our first token was queue wait, not the prefill on offer: 2000
+			// ms is past 3x1 ms plus the 250 ms of slack.
+			name:     "queue dominated window",
+			post:     after(1, 1, 1, 1, 400, 336),
+			total:    338,
+			ttft:     2000,
+			wantVals: map[string]float64{"prompt_n": 338, "cache_n": 0},
+			wantLog:  "timings(wall) pp 338 tok - t/s | tg 38 tok 69.1 t/s | cache 0",
+		},
+		{
+			name:     "computed more tokens than the whole prompt",
+			post:     after(1, 1, 1, 198, 400, 400),
+			total:    338,
+			ttft:     229,
+			wantVals: map[string]float64{"prompt_n": 338, "cache_n": 0},
+			wantLog:  "timings(wall) pp 338 tok - t/s | tg 38 tok 69.1 t/s | cache 0",
+		},
+		{
+			name:     "nothing was computed",
+			post:     after(1, 1, 1, 198, 400, 0),
+			total:    338,
+			ttft:     229,
+			wantVals: map[string]float64{"prompt_n": 338, "cache_n": 0},
+			wantLog:  "timings(wall) pp 338 tok - t/s | tg 38 tok 69.1 t/s | cache 0",
+		},
+		{
+			name:     "no prefill finished",
+			post:     after(0, 1, 1, 198, 400, 336),
+			total:    338,
+			ttft:     229,
+			wantVals: map[string]float64{"prompt_n": 338, "cache_n": 0},
+			wantLog:  "timings(wall) pp 338 tok - t/s | tg 38 tok 69.1 t/s | cache 0",
+		},
+		{
+			name:     "two prefills finished",
+			post:     after(2, 2, 2, 198, 400, 336),
+			total:    338,
+			ttft:     229,
+			wantVals: map[string]float64{"prompt_n": 338, "cache_n": 0},
+			wantLog:  "timings(wall) pp 338 tok - t/s | tg 38 tok 69.1 t/s | cache 0",
+		},
+		{
+			name:     "no decode finished",
+			post:     after(1, 0, 1, 198, 400, 336),
+			total:    338,
+			ttft:     229,
+			wantVals: map[string]float64{"prompt_n": 338, "cache_n": 0},
+			wantLog:  "timings(wall) pp 338 tok - t/s | tg 38 tok 69.1 t/s | cache 0",
+		},
+		{
+			name:     "prefill time moved backwards",
+			post:     after(1, 1, 1, -5, 400, 336),
+			total:    338,
+			ttft:     229,
+			wantVals: map[string]float64{"prompt_n": 338, "cache_n": 0},
+			wantLog:  "timings(wall) pp 338 tok - t/s | tg 38 tok 69.1 t/s | cache 0",
+		},
+		{
+			name:     "the computed count moved backwards",
+			post:     after(1, 1, -1, 198, 400, 336),
+			total:    338,
+			ttft:     229,
+			wantVals: map[string]float64{"prompt_n": 338, "cache_n": 0},
+			wantLog:  "timings(wall) pp 338 tok - t/s | tg 38 tok 69.1 t/s | cache 0",
+		},
+		{
+			// The engine restarted mid-request and every counter started over.
+			name:     "the counters restarted",
+			post:     hist{},
+			total:    338,
+			ttft:     229,
+			wantVals: map[string]float64{"prompt_n": 338, "cache_n": 0},
+			wantLog:  "timings(wall) pp 338 tok - t/s | tg 38 tok 69.1 t/s | cache 0",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var log []string
+			d := testDeps(&appconf.Config{}, &log)
+			st, tSend := measuredStream(tc.total, tc.ttft)
+			post := tc.post
+			timings := newVLLM(d).FinalTimings(st, measuredPre.snapshot(), post.snapshot(), tSend)
+
+			if len(log) != 1 || log[0] != tc.wantLog {
+				t.Errorf("log = %v, want %q", log, tc.wantLog)
+			}
+			if _, ok := timings["prompt_ms"]; ok != tc.attribut {
+				t.Errorf("prompt_ms present = %v, want %v", ok, tc.attribut)
+			}
+			for k, want := range tc.wantVals {
+				if got := NumOr(timings, k, -1); got != want {
+					t.Errorf("%s = %v, want %v", k, got, want)
+				}
+			}
+		})
+	}
+}
+
+// TestVLLMFinalTimingsWithoutSnapshots: a dead /metrics leaves the window empty.
+func TestVLLMFinalTimingsWithoutSnapshots(t *testing.T) {
+	var log []string
+	d := testDeps(&appconf.Config{}, &log)
+	st, tSend := measuredStream(338, 229)
+	b := newVLLM(d)
+	for _, c := range []struct {
+		name      string
+		pre, post *Snapshot
+	}{
+		{"no snapshots", nil, nil},
+		{"no opening snapshot", nil, measuredPre.snapshot()},
+		{"no closing snapshot", measuredPre.snapshot(), nil},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			timings := b.FinalTimings(st, c.pre, c.post, tSend)
+			if _, ok := timings["prompt_ms"]; ok {
+				t.Errorf("no window means no prompt rate: %v", timings)
+			}
+			if !strings.Contains(log[len(log)-1], "timings(wall)") {
+				t.Errorf("log = %s, want the wall fallback", log[len(log)-1])
+			}
+		})
+	}
+}
+
+// TestWallTimingsAreCountsOnly: the fallback keeps the counts the UI adds up for
+// the context gauge, and never carries a prompt rate.
+func TestWallTimingsAreCountsOnly(t *testing.T) {
+	st, _ := measuredStream(338, 229)
+	timings := WallTimings(st)
+	if got := sortedKeysOf(timings); strings.Join(got, " ") != "cache_n predicted_ms predicted_n prompt_n" {
+		t.Errorf("key set = %v, want the counts and the decode window", got)
+	}
+	if _, ok := timings["prompt_ms"]; ok {
+		t.Error("the send-to-first-token window is queueing plus prefill, so it gives no prompt rate")
+	}
+	if got := NumOr(timings, "prompt_n", -1); got != 338 {
+		t.Errorf("with no cached_tokens field the whole prompt counts as prompt_n, got %v", got)
+	}
+	if got := NumOr(timings, "cache_n", -1); got != 0 {
+		t.Errorf("cache_n = %v, want 0", got)
+	}
+	if got := NumOr(timings, "predicted_ms", -1); got != 550 {
+		t.Errorf("decode stays, since it is directly observed: predicted_ms = %v", got)
+	}
+
+	// The same request on a build that does report reuse.
+	st.Usage = jsonMap(`{"prompt_tokens":338,"completion_tokens":38,"prompt_tokens_details":{"cached_tokens":300}}`)
+	timings = WallTimings(st)
+	if got := NumOr(timings, "prompt_n", -1); got != 38 {
+		t.Errorf("prompt_n = %v, want the 38 tokens left after reuse", got)
+	}
+	if got := NumOr(timings, "cache_n", -1); got != 300 {
+		t.Errorf("cache_n = %v, want 300", got)
+	}
+	if _, ok := timings["prompt_ms"]; ok {
+		t.Error("a reported cache does not make the wall window a prefill")
+	}
+}
+
+func sortedKeysOf(m map[string]any) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }
 
 func jsonMap(text string) map[string]any {

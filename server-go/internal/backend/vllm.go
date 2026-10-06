@@ -131,28 +131,67 @@ func (v *vllm) RewriteChunk(chunk map[string]any, st *Stream) {
 	}
 }
 
-// FinalTimings uses the histogram deltas, but only when this request was alone
-// in the window.
-func (v *vllm) FinalTimings(st *Stream, pre, post *Snapshot, tSend time.Time) map[string]any {
-	timings := WallTimings(st, tSend)
-	source := "wall"
-	dCount := 0.0
-	if pre != nil && post != nil {
-		dCount = post.Num("prefillCount") - pre.Num("prefillCount")
+// engineWindow is the slice of the engine histograms one request owns.
+type engineWindow struct {
+	promptN  float64
+	promptMS float64
+	decodeMS float64
+}
+
+// attributeWindow decides whether the histogram diff between two scrapes can
+// only be our own request. This replaces an idle-server condition (nothing
+// running and nothing waiting when the window opened) that measurement showed
+// never holds: a shared box runs three or four requests all day, so the diff is
+// now attributed to our request among the concurrent ones by what the engine
+// cannot have done:
+//   - exactly one prefill and one decode finished in the window, and no counter
+//     moved backwards, which is what an engine restart mid-request looks like;
+//   - the computed tokens fit inside our own prompt, so a foreign request longer
+//     than that cannot be mistaken for us;
+//   - the prefill took no more time than the wall clock until our first token,
+//     and that token came within 3x the prefill plus 250 ms of slack, which
+//     covers network and the scrape gap. Without the bound a window where
+//     queueing dominated would have its wait reported as prefill speed.
+//
+// promptTotal is usage.prompt_tokens, ttftMS our own measured first token.
+func attributeWindow(pre, post *Snapshot, promptTotal, ttftMS float64) (engineWindow, bool) {
+	if pre == nil || post == nil {
+		return engineWindow{}, false
 	}
-	quiet := pre != nil && pre.Num("running") == 0 && pre.Num("waiting") == 0
-	rising := post != nil && pre != nil &&
-		post.Num("prefillSum") >= pre.Num("prefillSum") &&
-		post.Num("decodeSum") >= pre.Num("decodeSum") &&
-		post.Num("computedSum") >= pre.Num("computedSum")
-	if dCount == 1 && quiet && rising {
+	d := func(k string) float64 { return post.Num(k) - pre.Num(k) }
+	if d("prefillCount") != 1 || d("decodeCount") != 1 {
+		return engineWindow{}, false
+	}
+	for _, k := range []string{"prefillSum", "decodeSum", "computedCount", "computedSum"} {
+		if d(k) < 0 {
+			return engineWindow{}, false
+		}
+	}
+	promptN := math.Round(d("computedSum"))
+	if promptN < 1 || promptN > promptTotal {
+		return engineWindow{}, false
+	}
+	prefillMS := Round1(d("prefillSum") * 1000)
+	if prefillMS > ttftMS || ttftMS > prefillMS*3+250 {
+		return engineWindow{}, false
+	}
+	return engineWindow{promptN: promptN, promptMS: prefillMS, decodeMS: Round1(d("decodeSum") * 1000)}, true
+}
+
+// FinalTimings uses the histogram deltas, when they can only be this request's.
+func (v *vllm) FinalTimings(st *Stream, pre, post *Snapshot, tSend time.Time) map[string]any {
+	timings := WallTimings(st)
+	source := "wall"
+	promptTotal := NumOr(st.Usage, "prompt_tokens", 0)
+	w, ok := attributeWindow(pre, post, promptTotal, float64(msBetween(tSend, st.FirstAt)))
+	if ok {
 		source = "engine"
-		promptTotal := NumOr(st.Usage, "prompt_tokens", 0)
-		promptN := maxF(math.Round(post.Num("computedSum")-pre.Num("computedSum")), 0)
-		timings["prompt_ms"] = Round1((post.Num("prefillSum") - pre.Num("prefillSum")) * 1000)
-		timings["predicted_ms"] = orVal(Round1((post.Num("decodeSum")-pre.Num("decodeSum"))*1000), NumOr(timings, "predicted_ms", 0))
-		timings["prompt_n"] = promptN
-		timings["cache_n"] = maxF(promptTotal-promptN, 0)
+		timings["prompt_n"] = w.promptN
+		timings["cache_n"] = maxF(promptTotal-w.promptN, 0)
+		timings["prompt_ms"] = w.promptMS
+		if w.decodeMS != 0 {
+			timings["predicted_ms"] = w.decodeMS
+		}
 	}
 	v.d.Log(SpeedLine(source, timings))
 	return timings
@@ -373,13 +412,6 @@ func nilIfEmpty(s string) any {
 		return nil
 	}
 	return s
-}
-
-func orVal(v, def float64) float64 {
-	if v != 0 {
-		return v
-	}
-	return def
 }
 
 func orValStr(v, def string) string {

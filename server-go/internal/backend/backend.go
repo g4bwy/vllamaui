@@ -472,48 +472,46 @@ func commonTranslate(out map[string]any, drop map[string]bool, log Log) {
 
 // ---------- timings ----------
 
-// WallTimings builds a timings object from what the stream itself told us.
-// Every backend falls back to this when the engine reported nothing of its own.
-func WallTimings(st *Stream, tSend time.Time) map[string]any {
+// WallTimings builds counts from what the stream itself told us, and no prompt
+// rate: the window from send to first token holds queue wait and network as
+// well as the prefill, and usage.prompt_tokens counts tokens the engine reused
+// rather than computed. The decode rate stays, since those tokens were watched
+// one by one, and so do the counts, because the UI adds prompt_n + cache_n +
+// predicted_n for the context gauge. Every backend falls back to this when the
+// engine said nothing of its own.
+func WallTimings(st *Stream) map[string]any {
 	promptTotal := NumOr(st.Usage, "prompt_tokens", 0)
 	cached := NumOr(Obj(st.Usage, "prompt_tokens_details"), "cached_tokens", 0)
-	predictedN := NumOr(st.Usage, "completion_tokens", float64(st.Tokens))
-	timings := map[string]any{
-		"predicted_n": predictedN,
+	return map[string]any{
+		"predicted_n": NumOr(st.Usage, "completion_tokens", float64(st.Tokens)),
 		"predicted_ms": func() float64 {
 			if !st.FirstAt.IsZero() && !st.LastAt.IsZero() {
 				return Round1(maxF(float64(msBetween(st.FirstAt, st.LastAt)), 1))
 			}
 			return 0
 		}(),
+		"prompt_n": maxF(promptTotal-cached, 0),
+		"cache_n":  cached,
 	}
-	promptN := maxF(promptTotal-cached, 0)
-	if cached > 0 {
-		timings["cache_n"] = cached
+}
+
+// rate is tokens per second, or a dash when no measured window backs it up.
+func rate(n, ms float64) string {
+	if ms == 0 {
+		return "- t/s"
 	}
-	if promptN > 0 && !st.FirstAt.IsZero() {
-		timings["prompt_n"] = promptN
-		timings["prompt_ms"] = Round1(maxF(float64(msBetween(tSend, st.FirstAt)), 1))
-	}
-	return timings
+	return fmt.Sprintf("%.1f t/s", n/ms*1000)
 }
 
 // SpeedLine is the one log line per request naming the source of the numbers.
 func SpeedLine(source string, timings map[string]any) string {
-	promptMS := NumOr(timings, "prompt_ms", 0)
 	promptN := NumOr(timings, "prompt_n", 0)
-	predictedMS := NumOr(timings, "predicted_ms", 0)
 	predictedN := NumOr(timings, "predicted_n", 0)
-	pp := 0.0
-	if promptMS != 0 {
-		pp = promptN / promptMS * 1000
-	}
-	tg := 0.0
-	if predictedMS != 0 {
-		tg = predictedN / predictedMS * 1000
-	}
-	return fmt.Sprintf("timings(%s) pp %g tok %.1f t/s | tg %g tok %.1f t/s | cache %g",
-		source, promptN, pp, predictedN, tg, NumOr(timings, "cache_n", 0))
+	return fmt.Sprintf("timings(%s) pp %g tok %s | tg %g tok %s | cache %g",
+		source,
+		promptN, rate(promptN, NumOr(timings, "prompt_ms", 0)),
+		predictedN, rate(predictedN, NumOr(timings, "predicted_ms", 0)),
+		NumOr(timings, "cache_n", 0))
 }
 
 // ---------- rates ----------

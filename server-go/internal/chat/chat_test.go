@@ -193,16 +193,27 @@ vllm:generation_tokens_total 500
 `, count, prefillSum, count, decodeSum, count, computedSum, running, waiting)
 }
 
-// sseScript answers one streamed completion in vLLM spelling.
-func sseScript(w http.ResponseWriter, _ *http.Request) {
-	w.Write([]byte(": keep-alive\n\n"))
-	w.Write([]byte(`data: {"id":"c1","model":"qwen-test","choices":[{"index":0,"delta":{"role":"assistant","content":""}}]}` + "\n\n"))
-	w.Write([]byte(`data: {"id":"c1","model":"qwen-test","choices":[{"index":0,"delta":{"reasoning":"deep thought"},"token_ids":[1,2]}]}` + "\n\n"))
-	time.Sleep(4 * time.Millisecond)
-	w.Write([]byte(`data: {"id":"c1","model":"qwen-test","choices":[{"index":0,"delta":{"content":" answer"},"token_ids":[3]}]}` + "\n\n"))
-	w.Write([]byte(`data: {"id":"c1","model":"qwen-test","choices":[],"usage":{"prompt_tokens":10,"completion_tokens":3}}` + "\n\n"))
-	w.Write([]byte("data: [DONE]\n\n"))
+// sseScriptAfter answers one streamed completion in vLLM spelling, holding the
+// first token for firstToken. That hold is how a test puts its own measured
+// window around a given prefill, which is what the attribution rule compares.
+func sseScriptAfter(firstToken time.Duration) func(http.ResponseWriter, *http.Request) {
+	return func(w http.ResponseWriter, _ *http.Request) {
+		w.Write([]byte(": keep-alive\n\n"))
+		w.Write([]byte(`data: {"id":"c1","model":"qwen-test","choices":[{"index":0,"delta":{"role":"assistant","content":""}}]}` + "\n\n"))
+		time.Sleep(firstToken)
+		w.Write([]byte(`data: {"id":"c1","model":"qwen-test","choices":[{"index":0,"delta":{"reasoning":"deep thought"},"token_ids":[1,2]}]}` + "\n\n"))
+		time.Sleep(4 * time.Millisecond)
+		w.Write([]byte(`data: {"id":"c1","model":"qwen-test","choices":[{"index":0,"delta":{"content":" answer"},"token_ids":[3]}]}` + "\n\n"))
+		w.Write([]byte(`data: {"id":"c1","model":"qwen-test","choices":[],"usage":{"prompt_tokens":10,"completion_tokens":3}}` + "\n\n"))
+		w.Write([]byte("data: [DONE]\n\n"))
+	}
 }
+
+var sseScript = sseScriptAfter(0)
+
+// ssePrefill60 shows the first token 60 ms after the request, past the 50 ms
+// prefill the timing fixtures report and well inside the 3x plus 250 ms bound.
+var ssePrefill60 = sseScriptAfter(60 * time.Millisecond)
 
 func mustJSON(t *testing.T, text string) map[string]any {
 	t.Helper()
@@ -220,10 +231,12 @@ func TestStreamRewriteVLLM(t *testing.T) {
 	fake := &fakeUpstream{
 		models:  modelsJSON,
 		version: `{"version":"0.11.0"}`,
-		stream:  sseScript,
+		stream:  ssePrefill60,
 		metrics: []string{
-			metricsText(10, 1.0, 0.5, 200, 0, 0),
-			metricsText(11, 1.2, 0.7, 208, 0, 0),
+			// a shared engine: three requests running, four waiting, and one
+			// prefill of 50 ms that computed 8 of our 10 prompt tokens
+			metricsText(10, 1.0, 0.5, 200, 3, 4),
+			metricsText(11, 1.05, 0.55, 208, 3, 4),
 		},
 	}
 	tt := newTester(t, "vllm", fake, nil)
@@ -288,7 +301,7 @@ func TestStreamRewriteVLLM(t *testing.T) {
 	if timings == nil {
 		t.Fatalf("the last chunk must carry timings: %s", lines[3])
 	}
-	for k, want := range map[string]float64{"prompt_ms": 200, "predicted_ms": 200, "prompt_n": 8, "cache_n": 2, "predicted_n": 3} {
+	for k, want := range map[string]float64{"prompt_ms": 50, "predicted_ms": 50, "prompt_n": 8, "cache_n": 2, "predicted_n": 3} {
 		if got := backend.NumOr(timings, k, -1); got != want {
 			t.Errorf("%s = %v, want %v", k, got, want)
 		}
@@ -412,8 +425,11 @@ func TestInbandTimingsWin(t *testing.T) {
 	}
 }
 
-// TestVLLMWindowGuards: the histogram diff is trusted only for a request that
-// was alone in the window.
+// TestVLLMWindowGuards: the histogram diff is attributed by physical
+// consistency, so a lone finished request is recognised on a busy server and a
+// window that cannot be ours is left to the wall clock. The engine here always
+// reports three requests running and four waiting: nothing about the fixtures is
+// idle, which is the point.
 func TestVLLMWindowGuards(t *testing.T) {
 	type sample struct {
 		count    float64
@@ -423,27 +439,34 @@ func TestVLLMWindowGuards(t *testing.T) {
 		running  float64
 		waiting  float64
 	}
-	pre := sample{count: 10, prefill: 1.0, decode: 0.5, computed: 200}
-	post := sample{count: 11, prefill: 1.2, decode: 0.7, computed: 208}
+	busy := func(count, prefill, decode, computed float64) sample {
+		return sample{count: count, prefill: prefill, decode: decode, computed: computed, running: 3, waiting: 4}
+	}
+	// the window around the answer ssePrefill60 streams: one request finished,
+	// 8 of our 10 prompt tokens computed, 50 ms of prefill, 50 ms of decode
+	pre := busy(10, 1.0, 0.5, 200)
+	post := busy(11, 1.05, 0.55, 208)
 	cases := []struct {
-		name string
-		pre  sample
-		post sample
-		want string
+		name  string
+		pre   sample
+		post  sample
+		delay time.Duration
+		want  string
 	}{
-		{"clean", pre, post, "timings(engine)"},
-		{"no request finished", pre, pre, "timings(wall)"},
-		{"two requests finished", pre, sample{count: 12, prefill: 1.2, decode: 0.7, computed: 208}, "timings(wall)"},
-		{"something was running", sample{count: 10, prefill: 1, decode: 0.5, computed: 200, running: 1}, post, "timings(wall)"},
-		{"something was waiting", sample{count: 10, prefill: 1, decode: 0.5, computed: 200, waiting: 2}, post, "timings(wall)"},
-		{"prefill went backwards", pre, sample{count: 11, prefill: 0.9, decode: 0.7, computed: 208}, "timings(wall)"},
-		{"computed went backwards", pre, sample{count: 11, prefill: 1.2, decode: 0.7, computed: 190}, "timings(wall)"},
+		{"one request finished on a busy server", pre, post, 60 * time.Millisecond, "timings(engine)"},
+		{"no request finished", pre, pre, 60 * time.Millisecond, "timings(wall)"},
+		{"two requests finished", pre, busy(12, 1.05, 0.55, 208), 60 * time.Millisecond, "timings(wall)"},
+		{"prefill outlasts the wait for the first token", pre, busy(11, 1.3, 0.55, 208), 60 * time.Millisecond, "timings(wall)"},
+		{"the first token was queue wait", pre, post, 450 * time.Millisecond, "timings(wall)"},
+		{"computed more tokens than our whole prompt", pre, busy(11, 1.05, 0.55, 220), 60 * time.Millisecond, "timings(wall)"},
+		{"prefill went backwards", pre, busy(11, 0.9, 0.55, 208), 60 * time.Millisecond, "timings(wall)"},
+		{"computed went backwards", pre, busy(11, 1.05, 0.55, 190), 60 * time.Millisecond, "timings(wall)"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			fake := &fakeUpstream{
 				models: modelsJSON,
-				stream: sseScript,
+				stream: sseScriptAfter(tc.delay),
 				metrics: []string{
 					metricsText(tc.pre.count, tc.pre.prefill, tc.pre.decode, tc.pre.computed, tc.pre.running, tc.pre.waiting),
 					metricsText(tc.post.count, tc.post.prefill, tc.post.decode, tc.post.computed, tc.post.running, tc.post.waiting),
@@ -455,8 +478,24 @@ func TestVLLMWindowGuards(t *testing.T) {
 				t.Errorf("want %s, log was %v", tc.want, tt.logs())
 			}
 			lines := dataLines(rec.Body.String())
-			if backend.Obj(mustJSON(t, lines[len(lines)-2]), "timings") == nil {
+			timings := backend.Obj(mustJSON(t, lines[len(lines)-2]), "timings")
+			if timings == nil {
 				t.Error("the last chunk must always carry timings")
+			}
+			if tc.want == "timings(wall)" {
+				// the counts stay for the context gauge, the rate does not
+				if _, ok := timings["prompt_ms"]; ok {
+					t.Errorf("a window that is not ours carries no prompt rate: %v", timings)
+				}
+				if got := backend.NumOr(timings, "prompt_n", 0); got != 10 {
+					t.Errorf("prompt_n = %v, want the whole prompt the engine reported", got)
+				}
+				if got := backend.NumOr(timings, "cache_n", -1); got != 0 {
+					t.Errorf("cache_n = %v, want 0", got)
+				}
+				if got := backend.NumOr(timings, "predicted_ms", 0); got == 0 {
+					t.Error("the decode the stream was watched for stays")
+				}
 			}
 			if lines[len(lines)-1] != "[DONE]" {
 				t.Error("a complete answer still ends normally")

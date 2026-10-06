@@ -296,8 +296,9 @@ per-message statistics block disappears.
   and the clock since the first token. vLLM reports exact ids per chunk. Strata
   reports none, so the count there is characters divided by four, an estimate that
   the engine's own numbers replace when the answer finishes.
-- The last chunk carries `prompt_n`, `prompt_ms`, `predicted_n`, `predicted_ms`,
-  and `cache_n`.
+- The last chunk carries `prompt_n`, `predicted_n`, `predicted_ms` and `cache_n`,
+  plus `prompt_ms` when a prefill could be pinned to that request. Without it the UI
+  leaves out the prompt speed.
 
 An in-band engine error frame is not model output. The adapter logs it and withholds
 `[DONE]`, so the UI reports a lost stream instead of showing a cut-off answer as
@@ -316,11 +317,22 @@ chunk, measured by its own clock, and it includes the speculative draft counts.
 The adapter passes it through unchanged.
 
 **Engine, from counters.** vLLM reports nothing in the stream, so the adapter reads
-`GET /metrics` before and after each request and diffs the Prometheus histograms.
-It trusts the diff only when the window is clean: exactly one request finished
-during it, nothing else was in flight when it started, and no counter moved
-backwards, since an engine restart resets them. On a busy shared server those
-conditions often fail, and the adapter falls back to its own clock.
+`GET /metrics` before and after each request and diffs the Prometheus histograms. A
+shared server answers many clients at once, so the diff needs a reason to be yours.
+The adapter takes it when no other request can explain the numbers:
+
+- Exactly one prefill and one decode finished during the window, and no counter
+  moved backwards, since an engine restart resets them.
+- The tokens the engine computed fit inside your own prompt. A foreign request
+  longer than your whole prompt is not a match.
+- The prefill took no more time than the wait for your first token, and that token
+  arrived within three times the prefill plus 250 ms. The 250 ms covers the network
+  and the gap between the two scrapes. A first token that came later spent its time
+  waiting in a queue, so the prefill on offer is not the one you waited for.
+
+An earlier rule asked for an idle engine instead, with nothing running and nothing
+waiting when the window opened. On a box that permanently serves three or four
+requests at a time that never happened, and no request was ever attributed.
 
 | Value | vLLM counter | Strata field |
 | --- | --- | --- |
@@ -330,12 +342,29 @@ conditions often fail, and the adapter falls back to its own clock.
 | `cache_n` | `usage.prompt_tokens - prompt_n` | `timings.cache_n` |
 | `predicted_n` | `usage.completion_tokens` | `usage.completion_tokens` |
 
-**Wall clock.** The time between the request and the first token, and between the
-first and the last token.
+**Counts only.** When the window explains nothing, the adapter sends counts and no
+prompt speed. It logs the rate as a dash, so the two cases read differently:
+
+```
+timings(wall) pp 338 tok - t/s | tg 38 tok 69.1 t/s | cache 0
+```
+
+A prompt rate from the wall clock is wrong in two ways. The time between the request
+and the first token holds queue wait and network as well as the prefill, and
+`usage.prompt_tokens` counts tokens the engine reused rather than computed. This
+vLLM build answers `prompt_tokens_details: null`, so nothing corrects the second
+one. The UI only shows a prompt speed when `prompt_ms` is there, so it drops that
+line by itself and keeps the rest.
+
+The counts go anyway, because the UI adds `prompt_n + cache_n + predicted_n` for the
+context gauge. There `prompt_n` is the whole prompt and `cache_n` is 0 when the
+engine said nothing about reuse. The decode rate stays, since the adapter watched
+every token of it arrive.
 
 `prompt_n` counts tokens the engine actually computed, and `cache_n` counts tokens
-it reused. That matches llama.cpp, where the UI adds the two for the context gauge.
-Strata names the same split, which is why it passes straight through.
+it reused, whenever the numbers came from the engine. That matches llama.cpp, where
+the UI needs the two for the context gauge. Strata names the same split, which is why
+it passes straight through.
 
 The `/stats` payload mixes the two kinds as well. `Output` and `Prompt` are rates
 measured between two polls of cumulative counters, which both engines publish.
@@ -457,13 +486,14 @@ BACKEND=strata VLLM_UPSTREAM=http://127.0.0.1:8121 PORT=8097 node server/adapter
 
 Both mocks take switches and both advance their counters, so the two timing
 sources are testable offline: run one request and read the `timings(engine)` or
-`timings(wall)` tag in the log to see which one produced the number. A proxy that
-reused a cached scrape for both ends of its window would show up here as
-`timings(wall)`, which is how that bug was caught. Send `"truncate": true` to drop
-the stream mid-answer, which is how to see the lost-stream path. Strata's mock also
-takes `"error_mid_stream": true` and `"no_timings": true`, and reads `MOCK_VISION=1`
-and `MOCK_API_KEY`. `tests/restart-mock.sh [port]` restarts the Strata mock by pid
-file.
+`timings(wall)` tag in the log to see which one produced the number. A vLLM line with
+a dash where the `pp` rate should be says the window around that request explained
+nothing. A proxy that reused a cached scrape for both ends of its window would show
+up here as `timings(wall)`, which is how that bug was caught. Send `"truncate": true`
+to drop the stream mid-answer, which is how to see the lost-stream path. Strata's
+mock also takes `"error_mid_stream": true` and `"no_timings": true`, and reads
+`MOCK_VISION=1` and `MOCK_API_KEY`. `tests/restart-mock.sh [port]` restarts the Strata
+mock by pid file.
 
 To test against Strata's own code rather than a stand-in, run its real server with
 its scripted engine. It needs no GPU and no extra Python packages:
