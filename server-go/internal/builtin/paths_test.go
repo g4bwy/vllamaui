@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestResolvePath(t *testing.T) {
@@ -94,6 +95,41 @@ func TestGlobMatch(t *testing.T) {
 	for _, tc := range cases {
 		if got := globMatch(tc.pattern, tc.input); got != tc.want {
 			t.Errorf("globMatch(%q, %q) = %v, want %v", tc.pattern, tc.input, got, tc.want)
+		}
+	}
+}
+
+// TestGlobMatchNoCatastrophicBacktracking: the matcher branches at every star,
+// so a pile of "*a" pairs used to double its work per character of the name.
+// Sixteen pairs against a 34 character name took over 20 s, and 40 never came
+// back at all, which matters because the match runs after the walk deadline.
+// Failed (pattern, name) states are remembered now, so the work is bounded.
+// The time bound is loose on purpose: a timing assertion on a loaded CI runner
+// is flaky, and the answer being correct is the real point.
+func TestGlobMatchNoCatastrophicBacktracking(t *testing.T) {
+	name := strings.Repeat("a", 34)
+
+	cases := []struct {
+		pattern string
+		want    bool
+	}{
+		{strings.Repeat("*a", 16) + "b", false},  // no "b" to end on
+		{strings.Repeat("*a", 40) + "b", false},  // and not enough "a" either
+		{strings.Repeat("*a", 16), true},         // the accepted shape still works
+		{strings.Repeat("*a", 34), true},         // one "a" per pair, exactly
+		{strings.Repeat("**a", 16) + "b", false}, // the same pile with "**"
+		{strings.Repeat("*?a", 16) + "b", false}, // and with "?" between
+	}
+
+	for _, tc := range cases {
+		start := time.Now()
+		got := globMatch(tc.pattern, name)
+		elapsed := time.Since(start)
+		if got != tc.want {
+			t.Errorf("globMatch(%q, %q) = %v, want %v", tc.pattern, name, got, tc.want)
+		}
+		if elapsed > 2*time.Second {
+			t.Errorf("globMatch with a %d byte pattern took %v", len(tc.pattern), elapsed)
 		}
 	}
 }

@@ -61,34 +61,70 @@ func baseName(path string) string {
 // globMatch is a port of glob_match() in common/common.cpp: "*" matches within
 // one path segment, "**" matches anything including "/", "?" is one character
 // that is not "/", and "[...]" is a character class with ranges and "!".
+//
+// The matcher branches at every star, so a pile of "*a" pairs before a trailing
+// "b" nearly doubles its work every two characters of the name: 16 pairs
+// against a 34 character name took over 20 s, and 40 never came back. That is
+// far beyond any walk deadline, because the match runs once the listing is
+// done. Each state depends on (pi, si) alone, so a state that failed once is
+// remembered and fails at once on revisit. The work is then bounded by
+// len(pattern) x len(name), with the same accept and reject results.
 func globMatch(pattern, s string) bool {
-	return globMatchAt([]byte(pattern), 0, []byte(s), 0)
+	m := globMatcher{p: []byte(pattern), s: []byte(s), cols: len(s) + 1}
+	return m.at(0, 0)
 }
 
-func globMatchAt(p []byte, pi int, s []byte, si int) bool {
-	if pi == len(p) {
-		return si == len(s)
+// globMatcher is one pattern and name paired up, plus what has already failed.
+type globMatcher struct {
+	p, s []byte
+	cols int    // width of the failed table, one row per pattern index
+	bad  []bool // failed (pi, si) pairs at pi*cols+si, allocated on the first failure
+}
+
+// at is the memo shell around step: it answers a repeat of a failed state
+// without walking into it again.
+func (m *globMatcher) at(pi, si int) bool {
+	if pi == len(m.p) {
+		return si == len(m.s)
 	}
+	i := pi*m.cols + si
+	if m.bad != nil && m.bad[i] {
+		return false
+	}
+	if m.step(pi, si) {
+		return true
+	}
+	if m.bad == nil {
+		m.bad = make([]bool, (len(m.p)+1)*m.cols)
+	}
+	m.bad[i] = true
+	return false
+}
+
+// step matches p[pi:] against s[si:]. Every recursive call moves forward on at
+// least one side, so the depth is bounded by the two lengths added together.
+func (m *globMatcher) step(pi, si int) bool {
+	p, s := m.p, m.s
 	if p[pi] == '*' && pi+1 < len(p) && p[pi+1] == '*' {
-		if globMatchAt(p, pi+2, s, si) {
+		if m.at(pi+2, si) {
 			return true
 		}
 		if si < len(s) {
-			return globMatchAt(p, pi, s, si+1)
+			return m.at(pi, si+1)
 		}
 		return false
 	}
 	if p[pi] == '*' {
 		for si < len(s) && s[si] != '/' {
-			if globMatchAt(p, pi+1, s, si) {
+			if m.at(pi+1, si) {
 				return true
 			}
 			si++
 		}
-		return globMatchAt(p, pi+1, s, si)
+		return m.at(pi+1, si)
 	}
 	if p[pi] == '?' && si < len(s) && s[si] != '/' {
-		return globMatchAt(p, pi+1, s, si+1)
+		return m.at(pi+1, si+1)
 	}
 	if p[pi] == '[' {
 		end := pi + 1
@@ -102,15 +138,15 @@ func globMatchAt(p []byte, pi int, s []byte, si int) bool {
 			if si == len(s) {
 				return false
 			}
-			return globClass(p[pi+1:end], s[si]) && globMatchAt(p, end+1, s, si+1)
+			return globClass(p[pi+1:end], s[si]) && m.at(end+1, si+1)
 		}
 		if si < len(s) && s[si] == '[' {
-			return globMatchAt(p, pi+1, s, si+1)
+			return m.at(pi+1, si+1)
 		}
 		return false
 	}
 	if si < len(s) && p[pi] == s[si] {
-		return globMatchAt(p, pi+1, s, si+1)
+		return m.at(pi+1, si+1)
 	}
 	return false
 }
