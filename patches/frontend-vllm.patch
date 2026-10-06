@@ -53,10 +53,10 @@ index 8fa09cf..333de05 100644
  {/if}
 diff --git a/src/lib/components/app/chat/ChatForm/ChatFormContextGauge/VllmEngineStats.svelte b/src/lib/components/app/chat/ChatForm/ChatFormContextGauge/VllmEngineStats.svelte
 new file mode 100644
-index 0000000..0e3c2c6
+index 0000000..38432e9
 --- /dev/null
 +++ b/src/lib/components/app/chat/ChatForm/ChatFormContextGauge/VllmEngineStats.svelte
-@@ -0,0 +1,111 @@
+@@ -0,0 +1,131 @@
 +<script lang="ts">
 +	import { colorLevelBgClass } from './context-gauge';
 +	import ContextGaugeDetailRow from './ContextGaugeDetailRow.svelte';
@@ -86,6 +86,21 @@ index 0000000..0e3c2c6
 +		return ColorLevel.CRITICAL;
 +	}
 +
++	const title = $derived(
++		typeof vllmStore.stats?.title === 'string' && vllmStore.stats.title !== ''
++			? vllmStore.stats.title
++			: 'vLLM engine'
++	);
++	const kvLabel = $derived(
++		typeof vllmStore.stats?.labels?.kv === 'string' && vllmStore.stats.labels.kv !== ''
++			? vllmStore.stats.labels.kv
++			: 'KV cache'
++	);
++	const ttftLabel = $derived(
++		typeof vllmStore.stats?.labels?.ttft === 'string' && vllmStore.stats.labels.ttft !== ''
++			? vllmStore.stats.labels.ttft
++			: 'First token'
++	);
 +	const gauges = $derived(vllmStore.stats?.gauges);
 +	const rates = $derived(vllmStore.stats?.rates);
 +	const counters = $derived(vllmStore.stats?.counters);
@@ -114,15 +129,20 @@ index 0000000..0e3c2c6
 +
 +<div class="mt-3 border-t border-border/50 pt-4 text-xs">
 +	<div class="mb-2 flex items-baseline justify-between gap-2">
-+		<h3 class="text-[11px] font-medium uppercase tracking-wide text-muted-foreground/70">vLLM engine</h3>
++		<h3 class="text-[11px] font-medium uppercase tracking-wide text-muted-foreground/70">
++			{title}
++		</h3>
 +
-+		<span class="truncate text-[10px] text-muted-foreground/70" title="Values describe the whole engine, not this request">engine-wide</span>
++		<span
++			class="truncate text-[10px] text-muted-foreground/70"
++			title="Values describe the whole engine, not this request">engine-wide</span
++		>
 +	</div>
 +
 +	<div class="flex flex-col gap-2">
 +		{#if kvCache !== null}
 +			<div class="grid gap-1.5">
-+				<ContextGaugeDetailRow label="KV cache" value={kvCache} />
++				<ContextGaugeDetailRow label={kvLabel} value={kvCache} />
 +
 +				<div class="h-1.5 w-full overflow-hidden rounded-full bg-muted">
 +					<div
@@ -164,7 +184,7 @@ index 0000000..0e3c2c6
 +		{/if}
 +
 +		{#if firstToken !== null}
-+			<ContextGaugeDetailRow label="First token" value={firstToken} />
++			<ContextGaugeDetailRow label={ttftLabel} value={firstToken} />
 +		{/if}
 +	</div>
 +</div>
@@ -287,10 +307,10 @@ index 0000000..6b55a2a
 +
 +export const vllmStore = new VllmStore();
 diff --git a/src/lib/types/api.d.ts b/src/lib/types/api.d.ts
-index b52485a..51993e6 100644
+index b52485a..79cee67 100644
 --- a/src/lib/types/api.d.ts
 +++ b/src/lib/types/api.d.ts
-@@ -513,3 +513,48 @@ export interface ApiStreamSession {
+@@ -513,3 +513,52 @@ export interface ApiStreamSession {
  	started_at: number;
  	completed_at: number;
  }
@@ -302,6 +322,10 @@ index b52485a..51993e6 100644
 + * engine details are strings because the upstream reports them that way.
 + */
 +export interface ApiVllmStats {
++	// the backend names itself, so the heading is not tied to one engine
++	title?: string;
++	// the backend also renames the rows, so the wording comes from the payload
++	labels?: { kv?: string; ttft?: string };
 +	sampled_at?: string;
 +	gauges?: {
 +		requests_running?: number;

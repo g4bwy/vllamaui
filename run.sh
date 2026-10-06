@@ -6,8 +6,10 @@
 #
 # Configuration lives in .env (gitignored, see .env.example). Every value can
 # also come from the environment, which wins over the file:
-#   VLLM_UPSTREAM  vLLM base URL          (default http://localhost:8000)
+#   UPSTREAM_URL   backend base URL       (default http://localhost:8000)
+#   BACKEND        vllm, strata, or auto  (default auto)
 #   PORT           port to listen on      (default 8080)
+# VLLM_UPSTREAM still works as another name for UPSTREAM_URL.
 set -euo pipefail
 
 cd "$(dirname "$0")"
@@ -33,7 +35,9 @@ case "${1:-}" in
 	;;
 --status)
 	if running; then
-		echo "running pid $(cat "$PIDFILE") -> ${VLLM_UPSTREAM:-see .env}"
+		echo "running pid $(cat "$PIDFILE"), configuration in .env or the environment"
+		grep -m1 ' -> ' "$LOG" 2>/dev/null | sed 's/^[0-9:]* *//' | sed 's/^/  /' || true
+		grep -m1 'backend ' "$LOG" 2>/dev/null | sed 's/^[0-9:]* *//' | sed 's/^/  /' || true
 	else
 		echo "stopped"
 	fi

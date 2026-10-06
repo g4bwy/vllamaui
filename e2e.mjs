@@ -75,7 +75,7 @@ console.log('gauge popup:');
 console.log(
 	popup
 		.split('\n')
-		.filter((l) => /vLLM engine|KV cache|Output|Prompt|Requests|Prefix|Speculative|First token|Context|tokens/i.test(l))
+		.filter((l) => /ENGINE$|engine-wide|KV cache|VRAM|Output|Prompt|Requests|Prefix|Speculative|First token|Context|tokens/i.test(l))
 		.map((l) => '  ' + l)
 		.slice(0, 20)
 		.join('\n')

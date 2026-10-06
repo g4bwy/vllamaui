@@ -4,6 +4,8 @@ import { chromium } from '../frontend/node_modules/playwright/index.mjs';
 
 const IMAGE = process.env.TEST_IMAGE || '/tmp/vprobe.png';
 const EXPECT = (process.env.TEST_EXPECT || 'MANGO').toUpperCase();
+// a scripted backend answers with fixed text, so only the wire is meaningful
+const ASSERT_ANSWER = process.env.TEST_EXPECT_ANSWER !== '0';
 
 const browser = await chromium.launch({ args: ['--no-sandbox', '--disable-dev-shm-usage'] });
 const page = await browser.newPage({ viewport: { width: 1400, height: 900 } });
@@ -56,9 +58,9 @@ const lines = answer.split('\n').filter((l) => l.trim()).slice(-25);
 const gotText = answer.toUpperCase().includes(EXPECT);
 
 console.log('request carried an image part:', sentHadImage);
-console.log(`answer mentions ${EXPECT}:`, gotText);
+console.log(ASSERT_ANSWER ? `answer mentions ${EXPECT}: ${gotText}` : `answer mention test skipped (scripted backend)`);
 console.log('throughput lines:', lines.filter((l) => /t\/s|tokens/i.test(l)).slice(0, 6).join(' | '));
 console.log('tail:', JSON.stringify(lines.slice(-6)));
 console.log('problems:', [...new Set(problems)].join(' | ') || '(none)');
 await browser.close();
-process.exit(gotText && sentHadImage ? 0 : 1);
+process.exit(sentHadImage && (!ASSERT_ANSWER || gotText) ? 0 : 1);

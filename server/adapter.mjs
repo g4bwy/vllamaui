@@ -10,6 +10,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
+import { BACKENDS, parsePrometheus, parseCacheConfig } from './backends.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 
@@ -34,8 +35,10 @@ function loadDotEnv(file) {
 const usingDotEnv = loadDotEnv(path.resolve(HERE, '..', '.env'));
 
 const cfg = {
-	upstream: (process.env.VLLM_UPSTREAM || 'http://localhost:8000').replace(/\/+$/, ''),
-	apiKey: process.env.VLLM_API_KEY || process.env.OPENAI_API_KEY || '',
+	// auto asks the upstream what it is; set vllm or strata to skip that
+	backend: (process.env.BACKEND || 'auto').toLowerCase(),
+	upstream: (process.env.UPSTREAM_URL || process.env.VLLM_UPSTREAM || 'http://localhost:8000').replace(/\/+$/, ''),
+	apiKey: process.env.UPSTREAM_API_KEY || process.env.VLLM_API_KEY || process.env.OPENAI_API_KEY || '',
 	model: process.env.VLLM_MODEL || '',
 	nCtx: Number(process.env.VLLM_N_CTX || 0),
 	// auto = ask the engine. '1' forces it on, '0' forces it off
@@ -46,54 +49,6 @@ const cfg = {
 	port: Number(process.env.PORT || 8080),
 	dist: process.env.UI_DIST || path.resolve(HERE, '..', 'dist')
 };
-
-// llama.cpp-only fields vLLM does not implement. It ignores unknown fields, but
-// dropping them keeps the request clean and the logs readable.
-const DROP_LLAMA_ONLY = new Set([
-	'return_progress',
-	'sse_ping_interval',
-	'timings_per_token',
-	'backend_sampling',
-	'reasoning_control',
-	'thinking_budget_tokens',
-	'samplers',
-	'mirostat',
-	'mirostat_tau',
-	'mirostat_eta',
-	'xtc_probability',
-	'xtc_threshold',
-	'typ_p',
-	'dynatemp_range',
-	'dynatemp_exponent',
-	'dry_multiplier',
-	'dry_base',
-	'dry_allowed_length',
-	'dry_penalty_last_n',
-	'dry_sequence_breakers',
-	'top_n_sigma',
-	'n_keep',
-	'n_discard',
-	'min_keep',
-	'n_probs',
-	'post_sampling_probs',
-	'grammar',
-	'grammar_lazy',
-	'grammar_triggers',
-	'preserved_tokens',
-	'chat_format',
-	'reasoning_in_content',
-	'generation_prompt',
-	'lora',
-	'slot_id',
-	'nid',
-	'cache_prompt',
-	'normalize_prefix',
-	'penalize_nl',
-	'n_ctx'
-]);
-
-// Rejected outright (HTTP 400) by vLLM while speculative decoding is enabled.
-const DROP_UNSUPPORTED = new Set(['min_p', 'logit_bias']);
 
 const CONTENT_TYPES = {
 	'.html': 'text/html; charset=utf-8',
@@ -113,37 +68,10 @@ const CONTENT_TYPES = {
 	'.map': 'application/json'
 };
 
-// Prometheus metric name -> snapshot field. Sums across label sets (multi-engine).
-const METRICS = new Map([
-	['vllm:request_prefill_time_seconds_sum', 'prefillSum'],
-	['vllm:request_prefill_time_seconds_count', 'prefillCount'],
-	['vllm:request_decode_time_seconds_sum', 'decodeSum'],
-	['vllm:request_decode_time_seconds_count', 'decodeCount'],
-	['vllm:request_queue_time_seconds_sum', 'queueSum'],
-	['vllm:time_to_first_token_seconds_sum', 'ttftSum'],
-	['vllm:time_to_first_token_seconds_count', 'ttftCount'],
-	['vllm:inter_token_latency_seconds_sum', 'itlSum'],
-	['vllm:inter_token_latency_seconds_count', 'itlCount'],
-	['vllm:request_prefill_kv_computed_tokens_sum', 'computedSum'],
-	['vllm:request_prefill_kv_computed_tokens_count', 'computedCount'],
-	['vllm:prefix_cache_hits_total', 'prefixHits'],
-	['vllm:prefix_cache_queries_total', 'prefixQueries'],
-	['vllm:prompt_tokens_total', 'promptTokens'],
-	['vllm:generation_tokens_total', 'genTokens'],
-	['vllm:num_requests_running', 'running'],
-	['vllm:num_requests_waiting', 'waiting'],
-	['vllm:kv_cache_usage_perc', 'kvUsage'],
-	['vllm:spec_decode_num_drafts_total', 'specDrafts'],
-	['vllm:spec_decode_num_draft_tokens_total', 'specDraftTokens'],
-	['vllm:spec_decode_num_accepted_tokens_total', 'specAcceptedTokens'],
-	['vllm:num_preemptions_total', 'preemptions']
-]);
-
 let cachedModels = { at: 0, data: null };
-let lastStats = null;
-let observedReasoning = false;
-// resolved capability flag: false until the probe or a successful image says otherwise
-let visionSupported = cfg.vision === 'auto' ? false : cfg.vision;
+let lastSnapshot = null;
+// capability flags the two engines report in different ways
+const flags = { reasoning: false, vision: cfg.vision === 'auto' ? false : cfg.vision };
 // /props waits for these, bounded so a dead backend cannot stall the first
 // paint: after 2 s the page loads with what we know and retries /props anyway
 let probesReady = Promise.resolve();
@@ -210,56 +138,72 @@ async function listModels(force = false) {
 	}
 }
 
-async function upstreamVersion() {
+// one short label for /build.json, which the About dialog shows
+async function backendVersion() {
+	const d = await backend.describe().catch(() => null);
+	return (d?.build_info || backend.id).replace(/\s+/g, ' ').slice(0, 60);
+}
+
+// vLLM publishes Prometheus counters; the snapshot helper hands them to the
+// vllm backend. Strata publishes JSON on the same path, which its own backend
+// reads through fetchJson instead, so nothing here parses text for it.
+let metricsCache = { at: 0, text: '', parsed: null };
+
+async function prometheusSnapshot({ force = false, timeoutMs = 8000 } = {}) {
+	const fresh = force || !metricsCache.parsed || Date.now() - metricsCache.at >= 1500;
+	if (fresh) {
+		const res = await upstreamFetch('/metrics', { signal: AbortSignal.timeout(timeoutMs) });
+		if (!res.ok) {
+			res.body?.cancel().catch(() => {});
+			throw new Error(`metrics returned HTTP ${res.status}`);
+		}
+		const text = await res.text();
+		const parsed = parsePrometheus(text);
+		parsed.config = parseCacheConfig(text);
+		metricsCache = { at: Date.now(), text, parsed };
+	}
+	lastSnapshot = { at: metricsCache.at, snap: metricsCache.parsed };
+	return metricsCache.parsed;
+}
+
+// errors are expected here only when the backend is down
+async function safeSnapshot(opts) {
 	try {
-		return (await fetchJson('/version', 4000)).version || 'unknown';
-	} catch {
-		return 'unknown';
-	}
-}
-
-const SAMPLE = /^(\S+?)(?:\{[^\n]*\})? (\S+)(?: \d+)?$/;
-
-function parseMetrics(text) {
-	const out = {};
-	for (const line of text.split('\n')) {
-		if (!line || line[0] === '#') continue;
-		const m = SAMPLE.exec(line);
-		if (!m) continue;
-		const field = METRICS.get(m[1]);
-		if (!field) continue;
-		const v = Number(m[2]);
-		if (Number.isFinite(v)) out[field] = (out[field] || 0) + v;
-	}
-	return out;
-}
-
-// The UI polls /vllm/stats every few seconds. Cache the scrape so several tabs
-// share one upstream request, but never serve a stale body to a timing window:
-// the pre/post snapshots around a completion must be fresh or the delta is 0.
-let metricsCache = { at: 0, text: '' };
-
-async function metricsText(force = false, timeoutMs = 8000) {
-	if (!force && metricsCache.text && Date.now() - metricsCache.at < 1500) return metricsCache.text;
-	const res = await upstreamFetch('/metrics', { signal: AbortSignal.timeout(timeoutMs) });
-	if (!res.ok) {
-		res.body?.cancel().catch(() => {});
-		throw new Error(`metrics returned HTTP ${res.status}`);
-	}
-	const text = await res.text();
-	metricsCache = { at: Date.now(), text };
-	return text;
-}
-
-async function metricsSnapshot(timeoutMs = 8000) {
-	try {
-		const snap = parseMetrics(await metricsText(true, timeoutMs));
-		lastStats = { at: Date.now(), snap };
-		return snap;
+		return await backend.snapshot(opts);
 	} catch (e) {
-		log('metrics failed:', e.message);
+		log('snapshot failed:', e.message);
 		return null;
 	}
+}
+
+// ---------- backend selection ----------
+
+if (cfg.backend !== 'auto' && !BACKENDS[cfg.backend]) {
+	console.error(`BACKEND must be auto, ${Object.keys(BACKENDS).join(', ')}. Got "${cfg.backend}".`);
+	process.exit(1);
+}
+
+const ctx = {
+	cfg,
+	flags,
+	log,
+	fetchJson,
+	listModels,
+	prometheusSnapshot: (opts) => prometheusSnapshot(opts),
+	parsePrometheus
+};
+
+let backend = null;
+
+async function selectBackend() {
+	const wanted = cfg.backend;
+	if (wanted !== 'auto') return { id: wanted, def: BACKENDS[wanted](ctx) };
+	// Strata announces itself; vLLM answers /version. Either is one cheap GET.
+	const strata = BACKENDS.strata(ctx);
+	if (await strata.detect().catch(() => false)) return { id: 'strata', def: strata };
+	const vllm = BACKENDS.vllm(ctx);
+	if (await vllm.detect().catch(() => false)) return { id: 'vllm', def: vllm };
+	return { id: 'vllm', def: vllm }; // keep the older default for an unknown server
 }
 
 // ---------- llama.cpp API surface ----------
@@ -269,80 +213,49 @@ async function handleProps(req, res) {
 	const models = await listModels();
 	if (!models) {
 		// 503 is the code the UI reads as "backend not ready": it shows a
-		// spinner and retries once a second, so a restarting vLLM heals itself
-		return sendJson(res, 503, { error: { message: `cannot reach vLLM at ${cfg.upstream}` } });
+		// spinner and retries once a second, so a restarting backend heals itself
+		return sendJson(res, 503, { error: { message: `cannot reach the backend at ${cfg.upstream}` } });
 	}
-	const entry = models.data?.find((m) => m.id === cfg.model) || models.data?.[0];
-	const version = await upstreamVersion();
-	const spec = lastStats?.snap?.specDrafts > 0;
-	const n_ctx = cfg.nCtx || entry?.max_model_len || entry?.model_max_len || 4096;
+	const d = await backend.describe(models);
 
 	sendJson(res, 200, {
 		role: 'model',
-		model_path: entry?.id ?? cfg.model ?? 'unknown',
-		total_slots: 1,
-		// vLLM never serves its chat template, and the UI decides "this model
-		// can think" by string-scanning that template (utils/
-		// chat-template-thinking-detector.ts). Report the marker once the engine
-		// has actually emitted a reasoning delta, so the thinking control and
-		// the enable_thinking kwarg we map below become reachable in the UI.
-		chat_template: observedReasoning ? 'enable_thinking' : '',
+		model_path: d.model_path ?? d.entry?.id ?? cfg.model ?? 'unknown',
+		total_slots: d.total_slots ?? 1,
+		// vLLM never serves its chat template, and the UI decides whether the
+		// model can think by string-scanning that template (utils/
+		// chat-template-thinking-detector.ts). Strata ships a real one, so its
+		// backend passes the original text through and the UI reads it directly.
+		chat_template: d.chat_template ?? '',
 		bos_token: '',
-		eos_token: entry?.eos_token ?? '',
+		eos_token: d.entry?.eos_token ?? '',
 		// no backend address here: this response goes to every browser that loads
 		// the page, and the host is a private deployment detail. See var/adapter.log
-		build_info: `vllm ${version}`,
+		build_info: d.build_info,
 		cors_proxy_enabled: false,
-		modalities: { vision: visionSupported, audio: false, video: false },
+		modalities: d.modalities,
 		default_generation_settings: {
 			id: 0,
 			id_task: 0,
-			n_ctx,
-			speculative: Boolean(spec),
+			n_ctx: d.n_ctx,
+			speculative: Boolean(d.speculative),
 			is_processing: false,
 			prompt: '',
 			next_token: { has_next_token: false, has_new_line: false, n_remain: 0, n_decoded: 0, stopping_word: '' },
-			// Empty on purpose: the UI then sends no sampling params and vLLM
-			// server defaults rule. Values discovered here are copied into the UI
-			// parameter store, so a wrong default would follow every request.
-			params: {}
+			// vLLM reports nothing usable here, so the UI sends no sampling params
+			// and the server defaults rule. Strata answers this from its /props.
+			params: d.params ?? {}
 		}
 	});
 }
 
 function translateRequest(body) {
 	const out = { ...body };
-	const dropped = [];
-
-	if (out.reasoning_format === 'none') {
-		out.chat_template_kwargs = { ...(out.chat_template_kwargs || {}), enable_thinking: false, thinking: false };
-	}
-
-	for (const k of DROP_LLAMA_ONLY) if (k in out) dropped.push(k);
-	if (!cfg.keepUnsupported) for (const k of DROP_UNSUPPORTED) if (k in out) dropped.push(k);
-	for (const k of dropped) delete out[k];
-
-	if (typeof out.n_predict === 'number') {
-		// n_predict 0 is the prompt warm-up call: process the prompt, generate
-		// nothing. vLLM needs at least one token, so ask for the minimum.
-		out.max_tokens = out.n_predict === 0 ? 1 : out.n_predict;
-		delete out.n_predict;
-		dropped.push('n_predict>max_tokens');
-	}
-	if (out.max_tokens === 0) out.max_tokens = 1;
-	if (typeof out.max_tokens === 'number' && out.max_tokens < 0) delete out.max_tokens;
-
-	if (out.stream) {
-		// usage on the last chunk gives exact token counts for the timings
-		out.stream_options = { ...(out.stream_options || {}), include_usage: true };
-		out.return_token_ids = true;
-	}
-
-	if (dropped.length) log('dropped params:', dropped.join(' '));
-	return out;
+	backend.translate(out);
+	return backend.prepare(out);
 }
 
-// The UI omits "model" in single-model role, and vLLM rejects an empty id.
+// The UI omits "model" in single-model role, and both engines want one.
 let cachedDefaultModel = '';
 
 async function defaultModelId() {
@@ -368,48 +281,6 @@ function round1(n) {
 	return Math.round(n * 10) / 10;
 }
 
-function finalTimings(st, pre, post, tSend) {
-	const usage = st.usage || {};
-	const promptTotal = usage.prompt_tokens ?? 0;
-	const predicted_n = usage.completion_tokens ?? st.tokens;
-	const wallTtft = st.firstAt ? st.firstAt - tSend : 0;
-	const wallDecode = st.firstAt && st.lastAt ? Math.max(st.lastAt - st.firstAt, 1) : 0;
-
-	let prompt_ms = round1(wallTtft);
-	let predicted_ms = round1(wallDecode);
-	let prompt_n = promptTotal;
-	let cache_n = 0;
-	let source = 'wall';
-
-	// Trust the engine histograms only when the window is unambiguous: exactly
-	// one request finished, nothing else was in flight when it started, and no
-	// counter went backwards (that means the engine restarted mid-request).
-	const dCount = pre && post ? post.prefillCount - pre.prefillCount : 0;
-	const quiet = pre && (pre.running || 0) === 0 && (pre.waiting || 0) === 0;
-	const monotonic = post && pre && post.prefillSum >= pre.prefillSum && post.decodeSum >= pre.decodeSum && post.computedSum >= pre.computedSum;
-	if (dCount === 1 && quiet && monotonic) {
-		source = 'engine';
-		prompt_ms = round1((post.prefillSum - pre.prefillSum) * 1000);
-		predicted_ms = round1((post.decodeSum - pre.decodeSum) * 1000) || predicted_ms;
-		prompt_n = Math.max(Math.round(post.computedSum - pre.computedSum), 0);
-		cache_n = Math.max(promptTotal - prompt_n, 0);
-	}
-
-	const timings = { predicted_n, predicted_ms };
-	if (prompt_n > 0 && prompt_ms > 0) {
-		timings.prompt_n = prompt_n;
-		timings.prompt_ms = prompt_ms;
-	}
-	if (cache_n > 0) timings.cache_n = cache_n;
-
-	const pp = timings.prompt_ms ? (timings.prompt_n / timings.prompt_ms) * 1000 : 0;
-	const tg = predicted_ms ? (predicted_n / predicted_ms) * 1000 : 0;
-	log(
-		`timings(${source}) pp ${timings.prompt_n || 0} tok ${pp.toFixed(1)} t/s | tg ${predicted_n} tok ${tg.toFixed(1)} t/s | cache ${cache_n}`
-	);
-	return { timings, source };
-}
-
 async function handleChat(req, res) {
 	let body;
 	try {
@@ -421,10 +292,12 @@ async function handleChat(req, res) {
 	let out = translateRequest(body);
 	if (!out.model) out.model = await defaultModelId();
 
-	// Scrape metrics before the request leaves, but do not wait for it here: the
-	// engine's own prefill covers the round trip, and the timing window still
-	// starts before vLLM sees this request.
-	const prePromise = cfg.engineTimings ? metricsSnapshot() : Promise.resolve(null);
+	// vLLM reports nothing in the stream, so a Prometheus window around each
+	// request is the only way to get its real numbers. Start the first scrape
+	// before the request leaves, but do not wait for it: the engine's prefill
+	// covers the round trip. Strata puts timings in the stream, so no window.
+	const needWindow = backend.windowsTimings && cfg.engineTimings;
+	const prePromise = needWindow ? safeSnapshot({ force: true }) : Promise.resolve(null);
 	const tSend = Date.now();
 
 	// The UI cancels a generation by closing the fetch, so the only reliable
@@ -448,7 +321,7 @@ async function handleChat(req, res) {
 			log('client aborted before the engine answered');
 			return;
 		}
-		return sendJson(res, 502, { error: { message: `cannot reach vLLM at ${cfg.upstream}: ${e.message}` } });
+		return sendJson(res, 502, { error: { message: `cannot reach the ${backend.id} backend at ${cfg.upstream}: ${e.message}` } });
 	}
 
 	// keep the advertised capability in step with what the engine really does
@@ -456,16 +329,16 @@ async function handleChat(req, res) {
 
 	if (!upstream.ok) {
 		const text = await upstream.text();
-		if (sentImage && visionSupported && /image|visual|multimodal/i.test(text)) {
-			visionSupported = false;
+		if (sentImage && flags.vision && /image|visual|multimodal/i.test(text)) {
+			flags.vision = false;
 			log('vision support: off, the engine rejected an image request');
 		}
 		res.writeHead(upstream.status, { 'Content-Type': upstream.headers.get('content-type') || 'application/json' });
 		return res.end(text);
 	}
 
-	if (sentImage && !visionSupported) {
-		visionSupported = true;
+	if (sentImage && !flags.vision) {
+		flags.vision = true;
 		log('vision support: on, the engine accepted an image request');
 	}
 
@@ -507,8 +380,8 @@ async function handleChat(req, res) {
 		}
 
 		// short deadline: a stuck /metrics must not hold up the end of the stream
-		const post = cfg.engineTimings ? await metricsSnapshot(1500) : null;
-		const { timings } = finalTimings(st, pre, post, tSend);
+		const post = needWindow ? await safeSnapshot({ force: true, timeoutMs: 1500 }) : null;
+		const { timings } = backend.finalTimings(st, pre, post, tSend);
 
 		if (st.truncated) {
 			// no [DONE] here: the UI reads that as a finished answer, and a
@@ -549,23 +422,14 @@ async function handleChat(req, res) {
 
 		st.id = chunk.id || st.id;
 		st.model = chunk.model || st.model;
-		const choice = chunk.choices?.[0];
-
-		if (choice?.delta) {
-			const d = choice.delta;
-			if (typeof d.reasoning === 'string' && d.reasoning.length) {
-				d.reasoning_content = d.reasoning;
-				delete d.reasoning;
-				observedReasoning = true;
-			}
-			const hasText = (d.content && d.content.length) || (d.reasoning_content && d.reasoning_content.length) || d.tool_calls?.length;
-			if (hasText) {
-				if (!st.firstAt) st.firstAt = Date.now();
-				st.lastAt = Date.now();
-			}
-			if (Array.isArray(choice.token_ids)) st.tokens += choice.token_ids.length;
-			else if (hasText) st.tokens += 1;
+		// an engine that measures its own speed is always the better source
+		if (chunk.timings) st.inbandTimings = chunk.timings;
+		if (chunk.error) {
+			st.engineError = chunk.error.message || 'the engine reported an error';
+			log('engine error frame:', st.engineError);
+			return;
 		}
+		backend.rewriteChunk(chunk, st);
 
 		if (chunk.usage) {
 			st.usage = chunk.usage;
@@ -595,7 +459,7 @@ async function handleChat(req, res) {
 		buf += decoder.decode();
 		// a final line with no newline still has to reach the client
 		if (buf) await handleLine(buf.replace(/\r$/, ''));
-		st.truncated = !st.sawDone && !abort.signal.aborted;
+		st.truncated = (!st.sawDone || Boolean(st.engineError)) && !abort.signal.aborted;
 	} catch (e) {
 		if (!abort.signal.aborted) {
 			st.truncated = true;
@@ -610,86 +474,58 @@ async function handleChat(req, res) {
 // delta over a real time window is the rate the engine is holding right now.
 let rateWindow = null;
 
-function ratesFrom(snap, sampleAt) {
+function ratesFrom(snap, sampleAt, keys) {
 	const now = sampleAt || Date.now();
 	const prev = rateWindow;
-	rateWindow = {
-		at: now,
-		gen: snap.genTokens || 0,
-		prompt: snap.promptTokens || 0,
-		drafts: snap.specDrafts || 0,
-		draftTokens: snap.specDraftTokens || 0,
-		accepted: snap.specAcceptedTokens || 0
-	};
+	rateWindow = { at: now };
+	for (const k of Object.values(keys)) rateWindow[k] = snap[k] || 0;
 	if (!prev) return {};
 
+	const grew = (k) => (snap[k] || 0) >= (prev[k] || 0);
 	// an engine restart zeroes the counters, which would read as a huge
 	// negative throughput. Drop the window and start a new one.
-	if (rateWindow.gen < prev.gen || rateWindow.prompt < prev.prompt || rateWindow.draftTokens < prev.draftTokens) return {};
+	if (!Object.values(keys).every(grew)) return {};
 
 	const seconds = (now - prev.at) / 1000;
 	// A long gap means the window mostly covers idle time. Averaging over it
 	// would report a "current" rate that is really a stale average, so give up
 	// on rates for this sample and let the next poll measure a short window.
 	if (seconds < 0.5 || seconds > 60) return { window_s: round1(seconds) };
-	const per = (a, b) => round1((a - b) / seconds);
-	const dDraft = rateWindow.draftTokens - prev.draftTokens;
-	return {
-		window_s: round1(seconds),
-		generation_tokens_per_second: per(rateWindow.gen, prev.gen),
-		prompt_tokens_per_second: per(rateWindow.prompt, prev.prompt),
-		steps_per_second: per(rateWindow.drafts, prev.drafts),
-		window_accept_percent: dDraft > 0 ? round1(((rateWindow.accepted - prev.accepted) / dDraft) * 100) : 0
-	};
+	const per = (k) => round1(((snap[k] || 0) - (prev[k] || 0)) / seconds);
+	const out = { window_s: round1(seconds) };
+	if (keys.gen) out.generation_tokens_per_second = per(keys.gen);
+	if (keys.prompt) out.prompt_tokens_per_second = per(keys.prompt);
+	if (keys.drafts) out.steps_per_second = per(keys.drafts);
+	if (keys.accepted && keys.draftTokens && snap[keys.draftTokens] > prev[keys.draftTokens]) {
+		const dDraft = snap[keys.draftTokens] - prev[keys.draftTokens];
+		out.window_accept_percent = dDraft > 0 ? round1(((snap[keys.accepted] - prev[keys.accepted]) / dDraft) * 100) : 0;
+	}
+	return out;
+}
+
+// Short cache: the UI polls this every few seconds, and several tabs should
+// cost one upstream read.
+let statsCache = { at: 0, snap: null };
+
+async function statsSnapshot() {
+	if (statsCache.snap && Date.now() - statsCache.at < 1500) return statsCache;
+	const snap = await safeSnapshot({});
+	statsCache = { at: Date.now(), snap };
+	return statsCache;
 }
 
 async function handleStats(req, res) {
-	let snap = {};
-	let conf = {};
-	try {
-		const text = await metricsText();
-		snap = parseMetrics(text);
-		const line = text.split('\n').find((l) => l.startsWith('vllm:cache_config_info'));
-		if (line) {
-			conf = {};
-			for (const m of line.matchAll(/([a-zA-Z_0-9]+)="([^"]*)"/g)) conf[m[1]] = m[2];
-		}
-	} catch (e) {
-		return sendJson(res, 502, { error: `cannot read ${cfg.upstream}/metrics: ${e.message}` });
-	}
+	const { at, snap } = await statsSnapshot();
+	if (!snap) return sendJson(res, 502, { error: `cannot read stats from ${backend.id}` });
 
-	const pct = (a, b) => (b ? round1((a / b) * 100) : 0);
 	sendJson(res, 200, {
-		sampled_at: new Date().toISOString(),
-		gauges: {
-			requests_running: snap.running || 0,
-			requests_waiting: snap.waiting || 0,
-			kv_cache_usage_percent: round1((snap.kvUsage || 0) * 100),
-			prefix_cache_hit_percent: pct(snap.prefixHits || 0, snap.prefixQueries || 0),
-			spec_decode_accept_percent: pct(snap.specAcceptedTokens || 0, snap.specDraftTokens || 0),
-			tokens_per_step: snap.specDrafts ? round1(((snap.specAcceptedTokens || 0) + snap.specDrafts) / snap.specDrafts) : 0,
-			preemptions: snap.preemptions || 0
-		},
-		rates: ratesFrom(snap, metricsCache.at),
-		counters: {
-			prompt_tokens: snap.promptTokens || 0,
-			generation_tokens: snap.genTokens || 0,
-			requests: snap.prefillCount || 0,
-			avg_ttft_ms: snap.ttftCount ? round1((snap.ttftSum / snap.ttftCount) * 1000) : 0,
-			avg_inter_token_ms: snap.itlCount ? round1((snap.itlSum / snap.itlCount) * 1000) : 0,
-			avg_queue_ms: snap.prefillCount ? round1(((snap.queueSum || 0) / snap.prefillCount) * 1000) : 0,
-			avg_prefill_ms: snap.prefillCount ? round1((snap.prefillSum / snap.prefillCount) * 1000) : 0,
-			avg_decode_ms: snap.decodeCount ? round1((snap.decodeSum / snap.decodeCount) * 1000) : 0,
-			avg_prefill_tokens: snap.computedCount ? Math.round(snap.computedSum / snap.computedCount) : 0
-		},
-		engine: {
-			model: cfg.model,
-			block_size: conf.block_size,
-			num_gpu_blocks: conf.num_gpu_blocks,
-			kv_cache_size_tokens: conf.kv_cache_size_tokens,
-			prefix_caching: conf.enable_prefix_caching,
-			gpu_memory_utilization: conf.gpu_memory_utilization
-		}
+		title: backend.title,
+		sampled_at: new Date(at).toISOString(),
+		gauges: backend.gauges(snap),
+		labels: backend.labels,
+		rates: ratesFrom(snap, at, backend.rateKeys),
+		counters: backend.counters(snap),
+		engine: backend.engine(snap)
 	});
 }
 
@@ -734,7 +570,7 @@ function streamFile(res, method, file, size, type, cache) {
 
 // ---------- router ----------
 
-const NOT_FOUND_STREAM = { error: { message: 'stream replay is a llama.cpp feature, not available for vLLM' } };
+const NOT_FOUND_STREAM = { error: { message: 'stream replay is a llama.cpp feature, not available on this backend' } };
 
 async function route(req, res) {
 	const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
@@ -754,10 +590,10 @@ async function route(req, res) {
 	if (p === '/props') return handleProps(req, res);
 	if (p === '/v1/models' && method === 'GET') {
 		const models = await listModels(true);
-		return sendJson(res, models ? 200 : 502, models || { error: { message: `cannot reach vLLM at ${cfg.upstream}` } });
+		return sendJson(res, models ? 200 : 502, models || { error: { message: `cannot reach the backend at ${cfg.upstream}` } });
 	}
 	if (p === '/v1/chat/completions' && method === 'POST') return handleChat(req, res);
-	if (p === '/v1/chat/completions/control' && method === 'POST') return sendJson(res, 200, { success: false, error: 'not supported by vLLM' });
+	if (p === '/v1/chat/completions/control' && method === 'POST') return sendJson(res, 200, { success: false, error: `not supported by ${backend.id}` });
 	if (p === '/slots') return sendJson(res, 200, []);
 	if (p === '/tools') return sendJson(res, 200, []);
 	if (p === '/v1/streams/lookup' && method === 'POST') return sendJson(res, 200, []);
@@ -765,10 +601,10 @@ async function route(req, res) {
 		if (method === 'DELETE') return sendJson(res, 200, { success: true });
 		return sendJson(res, 404, NOT_FOUND_STREAM);
 	}
-	if (p === '/build.json') return sendJson(res, 200, { version: `vllm ${await upstreamVersion()}` });
-	if (p === '/vllm/stats') return handleStats(req, res);
+	if (p === '/build.json') return sendJson(res, 200, { version: await backendVersion() });
+	if (p === '/vllm/stats' || p === '/engine/stats') return handleStats(req, res);
 	if (p.startsWith('/models') || p === '/cors-proxy' || p === '/completion' || p === '/tokenize') {
-		return sendJson(res, 501, { success: false, error: `not available on a vLLM backend (${p})` });
+		return sendJson(res, 501, { success: false, error: `not available on a ${backend.id} backend (${p})` });
 	}
 
 	if (method !== 'GET' && method !== 'HEAD') return sendJson(res, 405, { error: 'method not allowed' });
@@ -790,7 +626,7 @@ async function probeThinkingSupport() {
 			})
 		});
 		if (res.ok && /"reasoning"\s*:/.test(await res.text())) {
-			observedReasoning = true;
+			flags.reasoning = true;
 			log('thinking support: yes (engine emitted reasoning deltas)');
 		}
 	} catch (e) {
@@ -803,8 +639,8 @@ async function probeThinkingSupport() {
 // image tells us. It costs one short prefill at startup.
 async function probeVisionSupport() {
 	if (cfg.vision !== 'auto') {
-		visionSupported = cfg.vision;
-		log(`vision: ${visionSupported ? 'on' : 'off'} (VLLM_MODALITY_VISION)`);
+		flags.vision = cfg.vision;
+		log(`vision: ${flags.vision ? 'on' : 'off'} (VLLM_MODALITY_VISION)`);
 		return;
 	}
 	if (process.env.VLLM_PROBE_VISION === '0') {
@@ -831,7 +667,7 @@ async function probeVisionSupport() {
 			})
 		});
 		if (res.ok) {
-			visionSupported = true;
+			flags.vision = true;
 			await res.body?.cancel();
 			log('vision support: yes (engine accepted an image)');
 		} else {
@@ -852,19 +688,27 @@ const server = http.createServer((req, res) => {
 	});
 });
 
-// Capability probes start before the port binds, so a client that loads
-// immediately cannot win the race against them.
-probesReady = Promise.all([probeThinkingSupport(), probeVisionSupport()]);
+// Pick the backend first: everything below depends on what it can tell us.
+const chosen = await selectBackend();
+backend = chosen.def;
+
+// Capability probes only run for a backend that has nothing better to say.
+// Strata reports vision and thinking in /props, so probing it again is waste.
+probesReady = (async () => {
+	if (backend.probes.thinking) await probeThinkingSupport();
+	else log('thinking support: from /props');
+	if (backend.probes.vision) await probeVisionSupport();
+	else log('vision support: from /props');
+})();
 
 server.listen(cfg.port, cfg.host, async () => {
 	const models = await listModels(true);
-	const version = await upstreamVersion();
-	await metricsSnapshot();
-	log(`llama.cpp webui -> vLLM adapter`);
-	log(`  ui      http://${cfg.host}:${cfg.port}/`);
-	log(`  backend ${cfg.upstream} (vllm ${version})`);
-	if (usingDotEnv) log('  loaded  .env (gitignored)');
-	log(`  model   ${models?.data?.map((m) => m.id).join(', ') || 'none reported'}`);
-	log(`  timings ${cfg.engineTimings ? 'engine histograms, wall-clock fallback' : 'wall clock only'}`);
+	await safeSnapshot({ force: true });
+	log(`llama.cpp webui -> ${backend.id} adapter`);
+	log(`  ui        http://${cfg.host}:${cfg.port}/`);
+	log(`  backend   ${cfg.upstream}`);
+	if (usingDotEnv) log('  loaded    .env (gitignored)');
+	log(`  model     ${models?.data?.map((m) => m.id).join(', ') || 'none reported'}`);
+	log(`  timings   ${backend.windowsTimings ? (cfg.engineTimings ? 'metrics window, wall-clock fallback' : 'wall clock only') : 'reported by the engine'}`);
 	await probeWait();
 });

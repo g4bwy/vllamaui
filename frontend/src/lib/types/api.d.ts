@@ -521,6 +521,10 @@ export interface ApiStreamSession {
  * engine details are strings because the upstream reports them that way.
  */
 export interface ApiVllmStats {
+	// the backend names itself, so the heading is not tied to one engine
+	title?: string;
+	// the backend also renames the rows, so the wording comes from the payload
+	labels?: { kv?: string; ttft?: string };
 	sampled_at?: string;
 	gauges?: {
 		requests_running?: number;
