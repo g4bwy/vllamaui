@@ -226,10 +226,17 @@ func (p *Proxy) stream(ctx context.Context, w http.ResponseWriter, upstream *htt
 		batch.Delta(backend.Obj(backend.FirstChoice(chunk), "delta"))
 
 		if usage := backend.Obj(chunk, "usage"); usage != nil {
-			// held back until the post-request snapshot, then sent last
 			st.Usage = usage
-			pending = chunk
-			return nil
+			// llama-server never puts usage on a chunk that carries text, and the
+			// vLLM include_usage chunk holds none, so those are held back until the
+			// post-request snapshot and sent last with the final timings. vLLM with
+			// stream_options {"continuous_usage_stats": true} stamps usage on every
+			// chunk instead: holding those back would strand the whole answer in
+			// the tail frame.
+			if !carriesText(chunk) {
+				pending = chunk
+				return nil
+			}
 		}
 
 		// live decode speed: the UI only knows t/s from server timings
@@ -318,6 +325,22 @@ func (p *Proxy) stream(ctx context.Context, w http.ResponseWriter, upstream *htt
 	}
 	_, _ = w.Write([]byte("data: [DONE]\n\n"))
 	_ = rc.Flush()
+}
+
+// carriesText says whether a streamed choice delta holds anything the reader has
+// to see: spoken text, thinking, or tool call fragments. It runs after the
+// backend rewrite, so both the webui spelling of the thinking field and the one
+// an engine that does not rename it sends are counted.
+func carriesText(chunk map[string]any) bool {
+	d := backend.Obj(backend.FirstChoice(chunk), "delta")
+	if d == nil {
+		return false
+	}
+	if backend.Str(d, "content") != "" || backend.Str(d, "reasoning_content") != "" ||
+		backend.Str(d, "reasoning") != "" {
+		return true
+	}
+	return len(backend.Arr(d, "tool_calls")) > 0
 }
 
 // mapMessageReasoning renames the thinking field of a non-streamed reply.

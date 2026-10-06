@@ -555,6 +555,130 @@ func TestUsageAbsentGetsSynthesizedChunk(t *testing.T) {
 	}
 }
 
+// continuousChunk is one chunk in the shape vLLM streams when asked for
+// stream_options {"continuous_usage_stats": true}: a usage block rides along on
+// every chunk, the ones carrying text included.
+func continuousChunk(delta, usage string) string {
+	return `{"id":"c1","model":"qwen-test","choices":[{"index":0,"delta":` + delta +
+		`,"finish_reason":null}],"usage":` + usage + `}`
+}
+
+// TestStreamContinuousUsageKeepsEveryToken is the silent data loss this fix is
+// about: a usage block on every chunk used to hold back every chunk, so a four
+// token answer arrived as one frame carrying the last delta only.
+func TestStreamContinuousUsageKeepsEveryToken(t *testing.T) {
+	texts := []string{"The", " quick", " brown", " fox"}
+	fake := &fakeUpstream{models: modelsJSON, stream: func(w http.ResponseWriter, _ *http.Request) {
+		for i, s := range texts {
+			usage := `{"prompt_tokens":10,"completion_tokens":` + fmt.Sprint(i+1) + `}`
+			fmt.Fprint(w, "data: "+continuousChunk(fmt.Sprintf(`{"content":%q}`, s), usage)+"\n\n")
+		}
+		// a continuous stream counts its usage on the tokens themselves, so no
+		// usage-only chunk arrives to hold back
+		fmt.Fprint(w, "data: [DONE]\n\n")
+	}}
+	tt := newTester(t, "vllm", fake, nil)
+	rec := tt.post(`{"messages":[],"stream":true}`)
+	lines := dataLines(rec.Body.String())
+	// one frame per token, the tail frame the proxy adds, then the end marker
+	if len(lines) != len(texts)+2 {
+		t.Fatalf("want %d data frames, got %d: %v", len(texts)+2, len(lines), lines)
+	}
+	if lines[len(lines)-1] != "[DONE]" {
+		t.Errorf("the stream must still end with [DONE]: %v", lines)
+	}
+	for i, want := range texts {
+		chunk := mustJSON(t, lines[i])
+		if got := backend.Str(backend.Obj(backend.FirstChoice(chunk), "delta"), "content"); got != want {
+			t.Errorf("frame %d: content = %q, want %q. no token may merge into another", i, got, want)
+		}
+		if backend.Obj(chunk, "usage") == nil {
+			t.Errorf("frame %d keeps the usage the engine sent with it: %s", i, lines[i])
+		}
+	}
+
+	// the usage is still recorded, so the reported counts come from the engine
+	// rather than from what the proxy counted by hand
+	timings := backend.Obj(mustJSON(t, lines[len(lines)-2]), "timings")
+	if timings == nil {
+		t.Fatalf("the tail frame carries the final timings: %s", lines[len(lines)-2])
+	}
+	if got := backend.NumOr(timings, "predicted_n", 0); got != float64(len(texts)) {
+		t.Errorf("predicted_n = %v, want the completion_tokens of the last chunk", got)
+	}
+}
+
+// TestStreamUsageOnlyFinalChunkIsStillHeld pins the include_usage shape, which is
+// what llama-server answers with: the last chunk carries usage and nothing else,
+// so it waits for the post-request snapshot and goes out last.
+func TestStreamUsageOnlyFinalChunkIsStillHeld(t *testing.T) {
+	const tail = `{"id":"c1","model":"qwen-test","choices":[],"usage":{"prompt_tokens":10,"completion_tokens":2}}`
+	fake := &fakeUpstream{models: modelsJSON, stream: func(w http.ResponseWriter, _ *http.Request) {
+		w.Write([]byte(`data: {"id":"c1","model":"qwen-test","choices":[{"index":0,"delta":{"content":"hi"},"token_ids":[1,2]}]}` + "\n\n"))
+		fmt.Fprint(w, "data: "+tail+"\n\n")
+		w.Write([]byte("data: [DONE]\n\n"))
+	}}
+	tt := newTester(t, "vllm", fake, nil)
+	rec := tt.post(`{"messages":[],"stream":true}`)
+	lines := dataLines(rec.Body.String())
+	// the text frame, the usage frame that was held, then the end marker
+	if len(lines) != 3 {
+		t.Fatalf("want 3 data frames, got %d: %v", len(lines), lines)
+	}
+	if !strings.Contains(lines[0], `"content":"hi"`) {
+		t.Errorf("the text chunk goes out as it arrives: %s", lines[0])
+	}
+	if lines[2] != "[DONE]" {
+		t.Errorf("the usage chunk must be the last one: %v", lines)
+	}
+
+	final := mustJSON(t, lines[1])
+	timings := backend.Obj(final, "timings")
+	if timings == nil {
+		t.Fatalf("the held chunk carries the final timings: %s", lines[1])
+	}
+	if backend.NumOr(timings, "predicted_n", 0) != 2 {
+		t.Errorf("predicted_n = %v, want the 2 tokens of the usage block", timings["predicted_n"])
+	}
+	data := func(m map[string]any) string {
+		raw, err := json.Marshal(m)
+		if err != nil {
+			t.Fatalf("cannot render %v: %v", m, err)
+		}
+		return string(raw)
+	}
+	// strip the timings the proxy adds and the frame is the engine's own, byte for
+	// byte: no field invented, none dropped
+	delete(final, "timings")
+	if got, want := data(final), data(mustJSON(t, tail)); got != want {
+		t.Errorf("the held chunk changed on the way out:\n got %s\nwant %s", got, want)
+	}
+}
+
+// TestStreamUsageWithToolCallsForwardsThem covers the third shape: an engine that
+// streams tool call arguments with usage on the same chunk. Holding those back
+// keeps the call out of the browser and the UI waits for arguments that came.
+func TestStreamUsageWithToolCallsForwardsThem(t *testing.T) {
+	usage := `{"prompt_tokens":10,"completion_tokens":9}`
+	chunks := []string{
+		continuousChunk(callDelta(`{"index":0,"id":"call_a","type":"function","function":{"name":"search","arguments":""}}`), usage),
+		continuousChunk(callDelta(`{"index":0,"function":{"arguments":"{\"query\":\"hi\"}"}}`), usage),
+		usageChunk,
+	}
+	got := forwardedToolIndexes(t, chunks)
+	if len(got) != 2 || got[0] != "0" || got[1] != "0" {
+		t.Fatalf("both argument deltas must reach the browser, got %v", got)
+	}
+	calls := webuiAggregate(t, forwardedChunks(t, chunks))
+	if len(calls) != 1 || calls[0] == nil {
+		t.Fatalf("want one call the UI can aggregate, got %s", calls)
+	}
+	want := aggregatedCall{id: "call_a", name: "search", args: `{"query":"hi"}`}
+	if *calls[0] != want {
+		t.Errorf("call = %s, want %s", calls[0], want.String())
+	}
+}
+
 func TestStrataCountsTokensByCharacters(t *testing.T) {
 	fake := &fakeUpstream{models: modelsJSON, stream: func(w http.ResponseWriter, _ *http.Request) {
 		w.Write([]byte(`data: {"choices":[{"index":0,"delta":{"content":"0123456789012345678901234567890123"}}]}` + "\n\n"))
