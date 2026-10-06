@@ -1,0 +1,3 @@
+dist/ linguist-generated -diff
+patches/frontend-vllm.patch -diff linguist-generated
+frontend/static/** linguist-generated

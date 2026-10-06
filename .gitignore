@@ -1,0 +1,21 @@
+# runtime state
+var/
+shots/
+
+# dependencies and build scratch
+node_modules/
+frontend/node_modules/
+frontend/.svelte-kit/
+frontend/dev-dist/
+frontend/dist/
+frontend/test-results/
+
+# editor and os noise
+.DS_Store
+*.log
+
+# note: ./dist at the repo root is committed on purpose. It is the
+# built UI the adapter serves, so a clone runs without npm install.
+
+# local machine configuration (backend host, api key): see .env.example
+.env

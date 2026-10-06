@@ -1,0 +1,355 @@
+diff --git a/src/lib/components/app/chat/ChatForm/ChatFormContextGauge/ContextGaugePopup.svelte b/src/lib/components/app/chat/ChatForm/ChatFormContextGauge/ContextGaugePopup.svelte
+index 8fa09cf..333de05 100644
+--- a/src/lib/components/app/chat/ChatForm/ChatFormContextGauge/ContextGaugePopup.svelte
++++ b/src/lib/components/app/chat/ChatForm/ChatFormContextGauge/ContextGaugePopup.svelte
+@@ -8,7 +8,10 @@
+ 		gaugePopup,
+ 		gaugePopupClose
+ 	} from './gauge-popup.svelte';
++	import VllmEngineStats from './VllmEngineStats.svelte';
++	import { VLLM_STATS_POLL_INTERVAL_MS } from '$lib/constants';
+ 	import { useContextGauge } from '$lib/hooks/use-context-gauge.svelte';
++	import { vllmStore } from '$lib/stores';
+ 	import { formatParameters } from '$lib/utils/formatters';
+ 
+ 	const gauge = useContextGauge();
+@@ -22,6 +25,26 @@
+ 
+ 	let cardEl = $state<HTMLElement | null>(null);
+ 
++	// The card markup only exists while the popup is open, so the vLLM stats
++	// probe runs from this component instead: it stays mounted with the chat
++	// form, which is the lifetime of the gauge area. Polling stops for good
++	// when the answer shows a plain llama.cpp server, which has no stats route.
++	$effect(() => {
++		if (vllmStore.supported === null) {
++			void vllmStore.refresh();
++
++			return;
++		}
++
++		if (vllmStore.supported === false) return;
++
++		const timer = setInterval(() => {
++			void vllmStore.refresh();
++		}, VLLM_STATS_POLL_INTERVAL_MS);
++
++		return () => clearInterval(timer);
++	});
++
+ 	// Any press outside the card and outside the dial closes the card.
+ 	// Presses on the dial are excluded because the dial handles its own
+ 	// toggle; the listener only exists while the card is open.
+@@ -116,6 +139,10 @@
+ 					transientDetails={gauge.transientDetails}
+ 				/>
+ 			{/if}
++
++			{#if vllmStore.supported}
++				<VllmEngineStats />
++			{/if}
+ 		</div>
+ 	</div>
+ {/if}
+diff --git a/src/lib/components/app/chat/ChatForm/ChatFormContextGauge/VllmEngineStats.svelte b/src/lib/components/app/chat/ChatForm/ChatFormContextGauge/VllmEngineStats.svelte
+new file mode 100644
+index 0000000..0e3c2c6
+--- /dev/null
++++ b/src/lib/components/app/chat/ChatForm/ChatFormContextGauge/VllmEngineStats.svelte
+@@ -0,0 +1,111 @@
++<script lang="ts">
++	import { colorLevelBgClass } from './context-gauge';
++	import ContextGaugeDetailRow from './ContextGaugeDetailRow.svelte';
++	import { STATS_UNITS } from '$lib/constants';
++	import { ColorLevel } from '$lib/enums';
++	import { vllmStore } from '$lib/stores';
++
++	// A number the adapter did not report stays null, so its row hides itself.
++	// Unknown is not the same as zero here.
++	function decimal(value: number | undefined): string | null {
++		return typeof value === 'number' ? value.toFixed(1) : null;
++	}
++
++	function percentValue(value: number | undefined): string | null {
++		const formatted = decimal(value);
++
++		return formatted === null ? null : `${formatted}%`;
++	}
++
++	function kvCacheColor(usage: number | undefined): ColorLevel {
++		if (usage === undefined) return ColorLevel.NEUTRAL;
++
++		if (usage < 60) return ColorLevel.OK;
++
++		if (usage < 85) return ColorLevel.WARNING;
++
++		return ColorLevel.CRITICAL;
++	}
++
++	const gauges = $derived(vllmStore.stats?.gauges);
++	const rates = $derived(vllmStore.stats?.rates);
++	const counters = $derived(vllmStore.stats?.counters);
++
++	const kvCacheUsage = $derived(gauges?.kv_cache_usage_percent);
++	const kvCache = $derived(percentValue(kvCacheUsage));
++	const kvCacheBgClass = $derived(colorLevelBgClass(kvCacheColor(kvCacheUsage)));
++	const outputRate = $derived(decimal(rates?.generation_tokens_per_second));
++	const promptRate = $derived(decimal(rates?.prompt_tokens_per_second));
++	const requests = $derived(
++		typeof gauges?.requests_running === 'number' && typeof gauges?.requests_waiting === 'number'
++			? `${gauges.requests_running} / ${gauges.requests_waiting}`
++			: null
++	);
++	const prefixCacheHit = $derived(percentValue(gauges?.prefix_cache_hit_percent));
++	const tokensPerStep = $derived(
++		(gauges?.tokens_per_step ?? 0) > 0 ? decimal(gauges?.tokens_per_step) : null
++	);
++	const specDecode = $derived(
++		tokensPerStep === null ? null : percentValue(gauges?.spec_decode_accept_percent)
++	);
++	const firstToken = $derived(
++		typeof counters?.avg_ttft_ms === 'number' ? `${Math.round(counters.avg_ttft_ms)} ms` : null
++	);
++</script>
++
++<div class="mt-3 border-t border-border/50 pt-4 text-xs">
++	<div class="mb-2 flex items-baseline justify-between gap-2">
++		<h3 class="text-[11px] font-medium uppercase tracking-wide text-muted-foreground/70">vLLM engine</h3>
++
++		<span class="truncate text-[10px] text-muted-foreground/70" title="Values describe the whole engine, not this request">engine-wide</span>
++	</div>
++
++	<div class="flex flex-col gap-2">
++		{#if kvCache !== null}
++			<div class="grid gap-1.5">
++				<ContextGaugeDetailRow label="KV cache" value={kvCache} />
++
++				<div class="h-1.5 w-full overflow-hidden rounded-full bg-muted">
++					<div
++						class="h-full rounded-full transition-all duration-300 {kvCacheBgClass}"
++						style="width: {kvCacheUsage}%"
++					></div>
++				</div>
++			</div>
++		{/if}
++
++		{#if outputRate !== null}
++			<ContextGaugeDetailRow
++				label="Output"
++				value={`${outputRate}${STATS_UNITS.TOKENS_PER_SECOND}`}
++			/>
++		{/if}
++
++		{#if promptRate !== null}
++			<ContextGaugeDetailRow
++				label="Prompt"
++				value={`${promptRate}${STATS_UNITS.TOKENS_PER_SECOND}`}
++			/>
++		{/if}
++
++		{#if requests !== null}
++			<ContextGaugeDetailRow label="Requests" value={requests} />
++		{/if}
++
++		{#if prefixCacheHit !== null}
++			<ContextGaugeDetailRow label="Prefix cache" value={prefixCacheHit} />
++		{/if}
++
++		{#if specDecode !== null}
++			<ContextGaugeDetailRow
++				label="Speculative"
++				subtitle={`${tokensPerStep} tok/step`}
++				value={specDecode}
++			/>
++		{/if}
++
++		{#if firstToken !== null}
++			<ContextGaugeDetailRow label="First token" value={firstToken} />
++		{/if}
++	</div>
++</div>
+diff --git a/src/lib/constants/ui.constants.ts b/src/lib/constants/ui.constants.ts
+index 20696f9..a12e7e8 100644
+--- a/src/lib/constants/ui.constants.ts
++++ b/src/lib/constants/ui.constants.ts
+@@ -35,6 +35,9 @@ export const MENU_OFFSET = 6;
+ 
+ export const PROCESSING_INFO_TIMEOUT = 2000;
+ 
++// How often the context gauge popup refreshes the vLLM engine stats
++export const VLLM_STATS_POLL_INTERVAL_MS = 3000;
++
+ /**
+  * Statistics units labels
+  */
+diff --git a/src/lib/services/vllm.service.ts b/src/lib/services/vllm.service.ts
+new file mode 100644
+index 0000000..46cd90f
+--- /dev/null
++++ b/src/lib/services/vllm.service.ts
+@@ -0,0 +1,22 @@
++/**
++ * VllmService - Reads engine-wide stats from the vLLM adapter
++ *
++ * `./vllm/stats` is an endpoint the adapter adds on top of a vLLM upstream.
++ * A plain llama.cpp server answers 404, 405 or 501. No reactive state;
++ * consumed by vllmStore.
++ */
++
++import type { ApiVllmStats } from '$lib/types';
++import { apiFetch } from '$lib/utils';
++
++export class VllmService {
++	/**
++	 * Fetches engine-wide stats.
++	 *
++	 * @throws ApiError carrying the HTTP status, so the caller can tell a
++	 * missing endpoint from a temporary outage
++	 */
++	static async fetchStats(): Promise<ApiVllmStats> {
++		return apiFetch<ApiVllmStats>('./vllm/stats', { authOnly: true });
++	}
++}
+diff --git a/src/lib/stores/index.ts b/src/lib/stores/index.ts
+index b571699..c2cee78 100644
+--- a/src/lib/stores/index.ts
++++ b/src/lib/stores/index.ts
+@@ -54,6 +54,9 @@ export { permissionsStore } from './permissions.svelte';
+ // TOOLS
+ export { toolsStore } from './tools.svelte';
+ 
++// VLLM ENGINE STATS (endpoint served by the vLLM adapter only)
++export { vllmStore } from './vllm.svelte';
++
+ // ENVIRONMENT / META
+ export { versionStore } from './version.svelte';
+ 
+diff --git a/src/lib/stores/vllm.svelte.ts b/src/lib/stores/vllm.svelte.ts
+new file mode 100644
+index 0000000..6b55a2a
+--- /dev/null
++++ b/src/lib/stores/vllm.svelte.ts
+@@ -0,0 +1,56 @@
++/**
++ * vllmStore - vLLM engine stats
++ *
++ * Holds the payload of `./vllm/stats`, an endpoint only the vLLM adapter
++ * serves. `supported` is null until the first probe: a plain llama.cpp server
++ * has no such route, and then every vLLM block in the UI stays hidden.
++ */
++
++import { ApiError } from '$lib/utils';
++import { VllmService } from '$lib/services/vllm.service';
++import type { ApiVllmStats } from '$lib/types';
++
++/** Statuses meaning "this backend has no stats route", which is final. */
++const MISSING_ENDPOINT_STATUSES = [404, 405, 501];
++
++/** Failed probes tolerated before deciding the backend is not vLLM. */
++const PROBE_RETRIES = 4;
++
++class VllmStore {
++	stats = $state<ApiVllmStats | null>(null);
++	supported = $state<boolean | null>(null);
++	private refreshing = false;
++	private probeFailures = 0;
++
++	/**
++	 * Refresh the stats. A failed fetch keeps the last values, so an outage
++	 * neither blanks nor hides a block that already showed data.
++	 */
++	async refresh(): Promise<void> {
++		if (this.refreshing) return;
++
++		this.refreshing = true;
++
++		try {
++			this.stats = await VllmService.fetchStats();
++			this.supported = true;
++			this.probeFailures = 0;
++		} catch (error) {
++			if (error instanceof ApiError && MISSING_ENDPOINT_STATUSES.includes(error.status)) {
++				this.supported = false;
++
++				return;
++			}
++
++			// 502 from the adapter means the upstream is unreachable right now:
++			// retry a few times before concluding this is not a vLLM backend
++			if (this.stats === null && ++this.probeFailures >= PROBE_RETRIES) {
++				this.supported = false;
++			}
++		} finally {
++			this.refreshing = false;
++		}
++	}
++}
++
++export const vllmStore = new VllmStore();
+diff --git a/src/lib/types/api.d.ts b/src/lib/types/api.d.ts
+index b52485a..51993e6 100644
+--- a/src/lib/types/api.d.ts
++++ b/src/lib/types/api.d.ts
+@@ -513,3 +513,48 @@ export interface ApiStreamSession {
+ 	started_at: number;
+ 	completed_at: number;
+ }
++
++/**
++ * Response from GET /vllm/stats, served by the vLLM adapter only.
++ * A plain llama.cpp server has no such route, so the block never renders there.
++ * Rate values are absent until the adapter has collected a full window, and the
++ * engine details are strings because the upstream reports them that way.
++ */
++export interface ApiVllmStats {
++	sampled_at?: string;
++	gauges?: {
++		requests_running?: number;
++		requests_waiting?: number;
++		kv_cache_usage_percent?: number;
++		prefix_cache_hit_percent?: number;
++		spec_decode_accept_percent?: number;
++		tokens_per_step?: number;
++		preemptions?: number;
++	};
++	rates?: {
++		window_s?: number;
++		generation_tokens_per_second?: number;
++		prompt_tokens_per_second?: number;
++		steps_per_second?: number;
++		window_accept_percent?: number;
++	};
++	counters?: {
++		prompt_tokens?: number;
++		generation_tokens?: number;
++		requests?: number;
++		avg_ttft_ms?: number;
++		avg_inter_token_ms?: number;
++		avg_queue_ms?: number;
++		avg_prefill_ms?: number;
++		avg_decode_ms?: number;
++		avg_prefill_tokens?: number;
++	};
++	engine?: {
++		model?: string;
++		block_size?: string;
++		num_gpu_blocks?: string;
++		kv_cache_size_tokens?: string;
++		prefix_caching?: string;
++		gpu_memory_utilization?: string;
++	};
++}
+diff --git a/src/lib/types/index.ts b/src/lib/types/index.ts
+index 453af9b..63d0da3 100644
+--- a/src/lib/types/index.ts
++++ b/src/lib/types/index.ts
+@@ -32,7 +32,8 @@ export type {
+ 	ApiModelsListResponse,
+ 	ApiModelsUnloadResponse,
+ 	AudioInputFormat,
+-	ApiStreamSession
++	ApiStreamSession,
++	ApiVllmStats
+ } from './api';
+ 
+ // HuggingFace types
